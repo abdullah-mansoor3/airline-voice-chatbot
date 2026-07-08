@@ -1,3 +1,13 @@
+docs/
+diagrams/
+
+# Node / Next.js
+node_modules/
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env*.local
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
