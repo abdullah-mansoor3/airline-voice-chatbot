@@ -1,19 +1,22 @@
 "use client";
 
 import type { Session } from "@supabase/supabase-js";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { supabase } from "../lib/supabase";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
 type ConnectionState = "connecting" | "connected" | "closed";
 type RecordingState = "idle" | "recording" | "processing";
+type LanguageMode = "auto" | "en" | "ur";
 
 type ServerEvent =
   | { type: "ready"; userId: string; conversationId: string }
   | { type: "auth_required"; message: string }
   | { type: "recording_started" }
-  | { type: "processing"; stage: "stt" | "tts" }
+  | { type: "processing"; stage: "stt" | "agent" | "tts" }
   | {
       type: "transcript";
       text: string;
@@ -21,7 +24,12 @@ type ServerEvent =
       language: string;
       detectedLanguage?: string;
     }
-  | { type: "agent_response"; text: string; language: string }
+  | {
+      type: "agent_response";
+      text: string;
+      language: string;
+      citations?: Citation[];
+    }
   | { type: "tts_audio"; mimeType: string; bytes: number }
   | { type: "turn_complete" }
   | { type: "cancelled" }
@@ -36,13 +44,32 @@ type ConversationSummary = {
   last_message_at: string | null;
 };
 
+type StoredMessage = {
+  id: string;
+  speaker: "user" | "agent";
+  original_text: string | null;
+  english_text: string | null;
+  created_at: string | null;
+};
+
 type Message = {
   id: string;
   speaker: "user" | "agent";
   text: string;
   englishText?: string | null;
   language: string;
+  citations?: Citation[];
   timestamp: Date;
+};
+
+type Citation = {
+  id: string;
+  title?: string | null;
+  heading?: string | null;
+  jurisdiction?: string | null;
+  score?: number | null;
+  originalText?: string | null;
+  sourceUrl?: string | null;
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -72,6 +99,9 @@ export default function Home() {
   const [currentTranscript, setCurrentTranscript] = useState("");
   const [currentResponse, setCurrentResponse] = useState("");
   const [detectedLanguage, setDetectedLanguage] = useState("");
+  const [textDraft, setTextDraft] = useState("");
+  const [languageMode, setLanguageMode] = useState<LanguageMode>("auto");
+  const [conversationMode, setConversationMode] = useState(false);
   const [error, setError] = useState("");
   const [vadVolume, setVadVolume] = useState(0); // 0-1 for visualiser
   const [isPlayingTts, setIsPlayingTts] = useState(false);
@@ -89,10 +119,34 @@ export default function Home() {
   const pendingChunksRef = useRef<Promise<void>[]>([]);
   const audioQueueRef = useRef<Blob[]>([]);
   const isPlayingRef = useRef(false);
+  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
+  const currentAudioUrlRef = useRef<string | null>(null);
+  const lastTurnWasVoiceRef = useRef(false);
+  const pendingAutoListenRef = useRef(false);
+  const conversationModeRef = useRef(false);
+  const recordingStateRef = useRef<RecordingState>("idle");
+  const connectionRef = useRef<ConnectionState>("connecting");
+  const sessionRef = useRef<Session | null>(null);
   const nextExpectedBytesRef = useRef<number | null>(null);
   const messageFeedRef = useRef<HTMLDivElement | null>(null);
 
   // ── Auth ───────────────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
+
+  useEffect(() => {
+    conversationModeRef.current = conversationMode;
+  }, [conversationMode]);
+
+  useEffect(() => {
+    recordingStateRef.current = recordingState;
+  }, [recordingState]);
+
+  useEffect(() => {
+    connectionRef.current = connection;
+  }, [connection]);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
@@ -156,12 +210,19 @@ export default function Home() {
     socket.onclose = () => {
       setConnection("closed");
       setStatus("Disconnected");
+      clearPlayback();
     };
 
     return () => {
       socket.close();
       stopStream();
+      clearPlayback();
     };
+  }, [session, conversationId]);
+
+  useEffect(() => {
+    if (!session || !conversationId) return;
+    loadMessages(conversationId);
   }, [session, conversationId]);
 
   // ── Audio Queue (sequential TTS playback) ─────────────────────────────────
@@ -173,26 +234,48 @@ export default function Home() {
     setIsPlayingTts(true);
 
     const url = URL.createObjectURL(blob);
+    currentAudioUrlRef.current = url;
     const audio = new Audio(url);
+    currentAudioRef.current = audio;
     audio.onended = () => {
-      URL.revokeObjectURL(url);
+      cleanupCurrentAudio();
       isPlayingRef.current = false;
       // Check for barge-in energy before playing the next sentence
       if (audioQueueRef.current.length > 0) {
         drainAudioQueue();
       } else {
         setIsPlayingTts(false);
+        maybeAutoListen();
       }
     };
     audio.onerror = () => {
-      URL.revokeObjectURL(url);
+      cleanupCurrentAudio();
       isPlayingRef.current = false;
+      setIsPlayingTts(false);
       drainAudioQueue();
     };
     audio.play().catch(() => {
+      cleanupCurrentAudio();
       isPlayingRef.current = false;
+      setIsPlayingTts(false);
       drainAudioQueue();
     });
+  }
+
+  function cleanupCurrentAudio() {
+    if (currentAudioUrlRef.current) {
+      URL.revokeObjectURL(currentAudioUrlRef.current);
+    }
+    currentAudioRef.current = null;
+    currentAudioUrlRef.current = null;
+  }
+
+  function clearPlayback() {
+    currentAudioRef.current?.pause();
+    cleanupCurrentAudio();
+    audioQueueRef.current = [];
+    isPlayingRef.current = false;
+    setIsPlayingTts(false);
   }
 
   // ── Server Event Handler ───────────────────────────────────────────────────
@@ -215,7 +298,13 @@ export default function Home() {
         break;
 
       case "processing":
-        setStatus(event.stage === "stt" ? "Transcribing…" : "Speaking…");
+        setStatus(
+          event.stage === "stt"
+            ? "Transcribing…"
+            : event.stage === "agent"
+              ? "Generating…"
+              : "Speaking…",
+        );
         setRecordingState("processing");
         break;
 
@@ -244,6 +333,7 @@ export default function Home() {
             speaker: "agent",
             text: event.text,
             language: event.language,
+            citations: event.citations,
             timestamp: new Date(),
           },
         ]);
@@ -257,15 +347,20 @@ export default function Home() {
       case "turn_complete":
         setStatus("Ready");
         setRecordingState("idle");
-        setIsPlayingTts(false);
+        if (lastTurnWasVoiceRef.current && conversationModeRef.current) {
+          pendingAutoListenRef.current = true;
+        }
+        if (!isPlayingRef.current && audioQueueRef.current.length === 0) {
+          setIsPlayingTts(false);
+          maybeAutoListen();
+        }
         loadConversations();
         break;
 
       case "cancelled":
         // Barge-in acknowledged — clear audio queue.
-        audioQueueRef.current = [];
-        isPlayingRef.current = false;
-        setIsPlayingTts(false);
+        clearPlayback();
+        pendingAutoListenRef.current = false;
         setStatus("Ready");
         setRecordingState("idle");
         break;
@@ -360,6 +455,7 @@ export default function Home() {
     setCurrentTranscript("");
     setCurrentResponse("");
     setDetectedLanguage("");
+    lastTurnWasVoiceRef.current = true;
 
     const socket = wsRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
@@ -408,7 +504,13 @@ export default function Home() {
       stopVad();
     };
 
-    socket.send(JSON.stringify({ type: "start", mimeType: recorder.mimeType }));
+    socket.send(
+      JSON.stringify({
+        type: "start",
+        mimeType: recorder.mimeType,
+        languageMode,
+      }),
+    );
     recorder.start(250); // 250 ms chunks for lower latency
     recorderRef.current = recorder;
     setRecordingState("recording");
@@ -434,6 +536,48 @@ export default function Home() {
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: "cancel" }));
     }
+    clearPlayback();
+    pendingAutoListenRef.current = false;
+    setRecordingState("idle");
+    setStatus("Ready");
+  }
+
+  function sendTextMessage() {
+    const text = textDraft.trim();
+    const socket = wsRef.current;
+    if (!text) return;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      setError("WebSocket is not connected.");
+      return;
+    }
+    setError("");
+    setCurrentTranscript(text);
+    setCurrentResponse("");
+    setTextDraft("");
+    setRecordingState("processing");
+    lastTurnWasVoiceRef.current = false;
+    socket.send(JSON.stringify({ type: "text_message", text, languageMode }));
+  }
+
+  function maybeAutoListen() {
+    if (!pendingAutoListenRef.current || !conversationModeRef.current) return;
+    if (
+      !sessionRef.current ||
+      connectionRef.current !== "connected" ||
+      recordingStateRef.current !== "idle"
+    ) {
+      return;
+    }
+    pendingAutoListenRef.current = false;
+    window.setTimeout(() => {
+      if (
+        conversationModeRef.current &&
+        recordingStateRef.current === "idle" &&
+        wsRef.current?.readyState === WebSocket.OPEN
+      ) {
+        startRecording();
+      }
+    }, 350);
   }
 
   // ── Auth Actions ──────────────────────────────────────────────────────────
@@ -477,6 +621,56 @@ export default function Home() {
     setConversations(data ?? []);
   }
 
+  async function deleteConversation(id: string) {
+    setError("");
+    if (!session) return;
+    const response = await fetch(`${apiUrl}/conversations/${id}`, {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${session.access_token}`,
+      },
+    });
+    if (!response.ok) {
+      const message = await response.text();
+      setError(message || "Could not delete conversation.");
+      return;
+    }
+    if (conversationId === id) {
+      setConversationId(null);
+      setMessages([]);
+      setCurrentTranscript("");
+      setCurrentResponse("");
+    }
+    setConversations((prev) => prev.filter((conversation) => conversation.id !== id));
+  }
+
+  async function loadMessages(id: string) {
+    const { data, error: loadError } = await supabase
+      .from("messages")
+      .select("id,speaker,original_text,english_text,created_at")
+      .eq("conversation_id", id)
+      .order("turn_index", { ascending: true });
+
+    if (loadError) {
+      setError(loadError.message);
+      return;
+    }
+
+    setMessages(
+      ((data ?? []) as StoredMessage[]).map((message) => {
+        const text = message.original_text ?? "";
+        return {
+          id: message.id,
+          speaker: message.speaker,
+          text,
+          englishText: message.english_text,
+          language: detectTextLanguage(text),
+          timestamp: message.created_at ? new Date(message.created_at) : new Date(),
+        };
+      }),
+    );
+  }
+
   function selectConversation(id: string) {
     setConversationId(id);
     setMessages([]);
@@ -515,9 +709,13 @@ export default function Home() {
   // ── Auto-scroll message feed ──────────────────────────────────────────────
 
   useEffect(() => {
-    messageFeedRef.current?.scrollTo({
-      top: messageFeedRef.current.scrollHeight,
-      behavior: "smooth",
+    const feed = messageFeedRef.current;
+    if (!feed) return;
+    requestAnimationFrame(() => {
+      feed.scrollTo({
+        top: feed.scrollHeight,
+        behavior: messages.length > 8 ? "auto" : "smooth",
+      });
     });
   }, [messages]);
 
@@ -527,6 +725,7 @@ export default function Home() {
   const isRecording = recordingState === "recording";
   const isProcessing = recordingState === "processing";
   const canRecord = !!session && isConnected && !isRecording && !isProcessing;
+  const isBusy = isRecording || isProcessing || isPlayingTts;
 
   const barWidth = `${Math.round(vadVolume * 100)}%`;
 
@@ -622,21 +821,38 @@ export default function Home() {
             </button>
             <div className="historyList">
               {conversations.map((c) => (
-                <button
+                <div
                   key={c.id}
                   id={`convo-${c.id}`}
                   className={`historyItem ${c.id === conversationId ? "active" : ""}`}
                   onClick={() => selectConversation(c.id)}
-                  type="button"
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") selectConversation(c.id);
+                  }}
                 >
-                  <span className="historyTitle">
-                    {c.title || "Voice claim"}
-                  </span>
-                  <span className="historyMeta">
-                    {c.primary_language?.toUpperCase() ?? "—"} ·{" "}
-                    {c.status ?? "active"}
-                  </span>
-                </button>
+                  <div className="historyText">
+                    <span className="historyTitle">
+                      {c.title || "Voice claim"}
+                    </span>
+                    <span className="historyMeta">
+                      {c.primary_language?.toUpperCase() ?? "—"} ·{" "}
+                      {c.status ?? "active"}
+                    </span>
+                  </div>
+                  <button
+                    className="historyDelete"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      deleteConversation(c.id);
+                    }}
+                    type="button"
+                    aria-label={`Delete ${c.title || "conversation"}`}
+                  >
+                    Delete
+                  </button>
+                </div>
               ))}
             </div>
           </section>
@@ -708,12 +924,30 @@ export default function Home() {
               <div className="bubbleLabel">
                 {msg.speaker === "user" ? "You" : "Agent"}
               </div>
-              <div className="bubbleText">{msg.text}</div>
+              <div className="bubbleText">
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                  {msg.text}
+                </ReactMarkdown>
+              </div>
               {msg.englishText && msg.language !== "en" && (
                 <div className="bubbleTranslation">
                   <span className="translationLabel">English:</span> {msg.englishText}
                 </div>
               )}
+              {msg.speaker === "agent" && msg.citations?.length ? (
+                <div className="citations" dir="ltr">
+                  <div className="citationTitle">Retrieved clauses</div>
+                  {msg.citations.map((citation) => (
+                    <details className="citationItem" key={citation.id}>
+                      <summary>
+                        {citation.title || "Policy document"}
+                        {citation.heading ? ` · ${citation.heading}` : ""}
+                      </summary>
+                      <pre>{citation.originalText || "No original text returned."}</pre>
+                    </details>
+                  ))}
+                </div>
+              ) : null}
             </div>
           ))}
           {isProcessing && (
@@ -726,47 +960,83 @@ export default function Home() {
           )}
         </div>
 
-        {/* ── Voice controls ── */}
+        {/* ── Chat composer ── */}
         <footer className="controls">
-          {/* VAD volume visualiser */}
           <div className="vadBar" aria-hidden="true">
             <div className="vadFill" style={{ width: barWidth }} />
           </div>
 
-          <div className="controlRow">
-            {/* Main record / stop button */}
-            {!isRecording ? (
+          <div className="modeRow">
+            <label className="modeField">
+              Language
+              <select
+                value={languageMode}
+                onChange={(event) => setLanguageMode(event.target.value as LanguageMode)}
+              >
+                <option value="auto">Auto</option>
+                <option value="ur">Force Urdu</option>
+                <option value="en">Force English</option>
+              </select>
+            </label>
+            <label className="toggleField">
+              <input
+                checked={conversationMode}
+                onChange={(event) => setConversationMode(event.target.checked)}
+                type="checkbox"
+              />
+              Hands-free voice conversation
+            </label>
+          </div>
+
+          <div className="composerRow">
+            <textarea
+              className="composerInput"
+              disabled={!session || !isConnected || isRecording || isProcessing}
+              onChange={(event) => setTextDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  sendTextMessage();
+                }
+              }}
+              placeholder="Type a claim, or use the mic"
+              rows={1}
+              value={textDraft}
+            />
+
+            {isBusy ? (
+              <button
+                className="stopGenerationBtn"
+                onClick={isRecording ? stopRecording : sendCancel}
+                type="button"
+                aria-label="Stop current action"
+              >
+                Stop
+              </button>
+            ) : (
+              <button
+                className="sendBtn"
+                disabled={!session || !isConnected || !textDraft.trim()}
+                onClick={sendTextMessage}
+                type="button"
+                aria-label="Send text"
+              >
+                Send
+              </button>
+            )}
+
+            {!isBusy ? (
               <button
                 id="record-btn"
-                className={`recBtn ${!canRecord ? "disabled" : ""}`}
+                className={`micBtn ${!canRecord ? "disabled" : ""}`}
                 disabled={!canRecord}
                 onClick={startRecording}
                 type="button"
                 aria-label="Start recording"
               >
-                <span className="recIcon" aria-hidden="true">●</span>
-                Record
+                Mic
               </button>
-            ) : (
-              <button
-                id="stop-btn"
-                className="recBtn recording"
-                onClick={stopRecording}
-                type="button"
-                aria-label="Stop recording"
-              >
-                <span className="stopIcon" aria-hidden="true">■</span>
-                Stop
-              </button>
-            )}
-
-            {/* TTS playing indicator */}
-            {isPlayingTts && (
-              <span className="ttsIndicator" aria-live="polite">
-                <span className="ttsWave" aria-hidden="true">▶</span>
-                Speaking…
-              </span>
-            )}
+            ) : null}
           </div>
 
           <p className="controlHint">
@@ -775,10 +1045,10 @@ export default function Home() {
               : !isConnected
                 ? "Reconnecting…"
                 : isRecording
-                  ? "VAD active — silence will auto-stop. Speak naturally."
-                  : isProcessing
-                    ? "Processing your claim…"
-                    : "Ready — press Record to speak."}
+                  ? "Listening… silence will auto-stop."
+                : isProcessing
+                    ? "Generating…"
+                    : "Ready."}
           </p>
         </footer>
       </main>
@@ -796,4 +1066,10 @@ function pickMimeType(): string | undefined {
     "audio/ogg;codecs=opus",
   ];
   return candidates.find((c) => MediaRecorder.isTypeSupported(c));
+}
+
+function detectTextLanguage(text: string): "ur" | "en" {
+  return [...text].some((char) => char >= "\u0600" && char <= "\u06ff")
+    ? "ur"
+    : "en";
 }

@@ -76,7 +76,7 @@ def _get_or_create_conversation_sync(
         .insert(
             {
                 "user_id": user_id,
-                "title": "Voice claim",
+                "title": _unique_conversation_title(client, user_id, "New conversation"),
                 "status": "active",
                 "primary_language": "ur",
             }
@@ -134,7 +134,12 @@ def _record_turn_sync(
         "primary_language": user_language,
     }
     if turn_index == 0 and user_text:
-        update_payload["title"] = user_text[:80]
+        update_payload["title"] = _unique_conversation_title(
+            client,
+            conversation.user_id,
+            user_text[:80],
+            exclude_conversation_id=conversation.id,
+        )
 
     client.table("conversations").update(update_payload).eq(
         "id", conversation.id
@@ -153,3 +158,34 @@ def _next_turn_index(client, conversation_id: str) -> int:
     if not response.data:
         return 0
     return int(response.data[0]["turn_index"]) + 1
+
+
+def _unique_conversation_title(
+    client,
+    user_id: str,
+    base_title: str,
+    *,
+    exclude_conversation_id: str | None = None,
+) -> str:
+    base = (base_title.strip() or "New conversation")[:80]
+    response = (
+        client.table("conversations")
+        .select("id,title")
+        .eq("user_id", user_id)
+        .execute()
+    )
+    existing = {
+        row["title"]
+        for row in (response.data or [])
+        if row.get("title") and row.get("id") != exclude_conversation_id
+    }
+    if base not in existing:
+        return base
+
+    counter = 2
+    while True:
+        suffix = f" ({counter})"
+        candidate = f"{base[:80 - len(suffix)]}{suffix}"
+        if candidate not in existing:
+            return candidate
+        counter += 1

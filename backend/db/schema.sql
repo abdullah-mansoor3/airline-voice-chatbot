@@ -16,18 +16,103 @@ create table if not exists public.conversations (
     status in ('active', 'closed', 'escalated')
   ),
   primary_language text,
+  short_term_summary text,
+  memory_updated_at timestamp with time zone,
   started_at timestamp with time zone not null default now(),
-  last_message_at timestamp with time zone not null default now()
+  last_message_at timestamp with time zone not null default now(),
+  unique (user_id, title)
 );
+
+alter table public.conversations
+  add column if not exists short_term_summary text,
+  add column if not exists memory_updated_at timestamp with time zone;
+
+do $$
+begin
+  with duplicates as (
+    select
+      id,
+      title,
+      row_number() over (
+        partition by user_id, title
+        order by started_at, id
+      ) as duplicate_index
+    from public.conversations
+    where title is not null
+  )
+  update public.conversations
+  set title = left(duplicates.title, 72) || ' (' || duplicates.duplicate_index || ')'
+  from duplicates
+  where conversations.id = duplicates.id
+    and duplicates.duplicate_index > 1;
+
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'conversations_user_id_title_key'
+      and conrelid = 'public.conversations'::regclass
+  ) then
+    alter table public.conversations
+      add constraint conversations_user_id_title_key unique (user_id, title);
+  end if;
+end $$;
 
 create table if not exists public.orders (
   id uuid primary key default gen_random_uuid(),
   user_id uuid references public.users(id) on delete cascade,
   duffel_order_id text,
+  booking_reference text,
+  airline text,
+  origin text,
+  destination text,
+  departure_date date,
   order_type text,
   amount numeric,
   fare_class text,
-  status text
+  status text,
+  raw_payload jsonb,
+  updated_at timestamp with time zone not null default now()
+);
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'orders_duffel_order_id_key'
+      and conrelid = 'public.orders'::regclass
+  ) then
+    alter table public.orders
+      add constraint orders_duffel_order_id_key unique (duffel_order_id);
+  end if;
+
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'orders_user_booking_reference_key'
+      and conrelid = 'public.orders'::regclass
+  ) then
+    alter table public.orders
+      add constraint orders_user_booking_reference_key unique (user_id, booking_reference);
+  end if;
+end $$;
+
+alter table public.orders
+  add column if not exists booking_reference text,
+  add column if not exists airline text,
+  add column if not exists origin text,
+  add column if not exists destination text,
+  add column if not exists departure_date date,
+  add column if not exists raw_payload jsonb,
+  add column if not exists updated_at timestamp with time zone not null default now();
+
+create table if not exists public.user_memories (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.users(id) on delete cascade,
+  memory_key text not null,
+  memory_value text not null,
+  confidence numeric not null default 0.8,
+  source text not null default 'conversation',
+  created_at timestamp with time zone not null default now(),
+  last_seen_at timestamp with time zone not null default now(),
+  unique (user_id, memory_key)
 );
 
 create table if not exists public.disputes (
@@ -47,7 +132,8 @@ create table if not exists public.policy_documents (
   version text,
   effective_date date,
   jurisdiction text not null,
-  category text not null
+  category text not null,
+  unique (title, version, jurisdiction)
 );
 
 create table if not exists public.policy_chunks (
@@ -55,7 +141,8 @@ create table if not exists public.policy_chunks (
   policy_document_id uuid not null references public.policy_documents(id) on delete cascade,
   pinecone_vector_id text unique,
   chunk_index int not null,
-  chunk_text text not null
+  chunk_text text not null,
+  unique (policy_document_id, chunk_index)
 );
 
 create table if not exists public.messages (
@@ -92,6 +179,7 @@ create table if not exists public.dispute_action_citations (
 alter table public.users enable row level security;
 alter table public.conversations enable row level security;
 alter table public.orders enable row level security;
+alter table public.user_memories enable row level security;
 alter table public.disputes enable row level security;
 alter table public.messages enable row level security;
 alter table public.dispute_actions enable row level security;
@@ -176,41 +264,71 @@ create trigger prevent_user_role_escalation
   before update of role on public.users
   for each row execute function public.prevent_user_role_escalation();
 
+drop policy if exists "users can read own profile" on public.users;
 create policy "users can read own profile"
   on public.users for select
   using (auth.uid() = id or public.is_admin());
 
+drop policy if exists "users can update own profile" on public.users;
 create policy "users can update own profile"
   on public.users for update
   using (auth.uid() = id)
   with check (auth.uid() = id);
 
+drop policy if exists "admins can manage profiles" on public.users;
 create policy "admins can manage profiles"
   on public.users for all
   using (public.is_admin())
   with check (public.is_admin());
 
+drop policy if exists "users can read own conversations" on public.conversations;
 create policy "users can read own conversations"
   on public.conversations for select
   using (auth.uid() = user_id or public.is_admin());
 
+drop policy if exists "users can create own conversations" on public.conversations;
 create policy "users can create own conversations"
   on public.conversations for insert
   with check (auth.uid() = user_id);
 
+drop policy if exists "users can update own conversations" on public.conversations;
 create policy "users can update own conversations"
   on public.conversations for update
   using (auth.uid() = user_id or public.is_admin())
   with check (auth.uid() = user_id or public.is_admin());
 
+drop policy if exists "users can delete own conversations" on public.conversations;
+create policy "users can delete own conversations"
+  on public.conversations for delete
+  using (auth.uid() = user_id or public.is_admin());
+
+drop policy if exists "users can read own orders" on public.orders;
 create policy "users can read own orders"
   on public.orders for select
   using (auth.uid() = user_id or public.is_admin());
 
+drop policy if exists "users can read own memories" on public.user_memories;
+create policy "users can read own memories"
+  on public.user_memories for select
+  using (auth.uid() = user_id or public.is_admin());
+
+drop policy if exists "users can update own memories" on public.user_memories;
+create policy "users can update own memories"
+  on public.user_memories for update
+  using (auth.uid() = user_id or public.is_admin())
+  with check (auth.uid() = user_id or public.is_admin());
+
+drop policy if exists "users can delete own memories" on public.user_memories;
+create policy "users can delete own memories"
+  on public.user_memories for delete
+  using (auth.uid() = user_id or public.is_admin());
+
+drop policy if exists "users can read own disputes" on public.disputes;
 create policy "users can read own disputes"
   on public.disputes for select
   using (auth.uid() = user_id or public.is_admin());
 
+drop policy if exists "users can read own messages" on public.messages;
 create policy "users can read own messages"
   on public.messages for select
   using (
@@ -222,6 +340,7 @@ create policy "users can read own messages"
     or public.is_admin()
   );
 
+drop policy if exists "users can read own actions" on public.dispute_actions;
 create policy "users can read own actions"
   on public.dispute_actions for select
   using (
@@ -233,6 +352,7 @@ create policy "users can read own actions"
     or public.is_admin()
   );
 
+drop policy if exists "users can read own action citations" on public.dispute_action_citations;
 create policy "users can read own action citations"
   on public.dispute_action_citations for select
   using (
@@ -246,10 +366,12 @@ create policy "users can read own action citations"
     or public.is_admin()
   );
 
+drop policy if exists "policy documents are readable" on public.policy_documents;
 create policy "policy documents are readable"
   on public.policy_documents for select
   using (true);
 
+drop policy if exists "policy chunks are readable" on public.policy_chunks;
 create policy "policy chunks are readable"
   on public.policy_chunks for select
   using (true);

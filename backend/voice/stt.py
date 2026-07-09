@@ -33,6 +33,7 @@ async def transcribe_audio(
     *,
     filename: str,
     content_type: str,
+    language_hint: str | None = None,
 ) -> TranscriptionResult:
     """Fire ``transcribe`` and ``translate`` in parallel on the same audio buffer.
 
@@ -48,11 +49,15 @@ async def transcribe_audio(
 
     client = AsyncGroq(api_key=api_key)
 
-    transcribe_coro = client.audio.transcriptions.create(
-        file=(filename, audio_bytes, content_type),
-        model=_TRANSCRIBE_MODEL,
-        response_format="verbose_json",
-    )
+    transcribe_kwargs = {
+        "file": (filename, audio_bytes, content_type),
+        "model": _TRANSCRIBE_MODEL,
+        "response_format": "verbose_json",
+    }
+    if language_hint in {"en", "ur"}:
+        transcribe_kwargs["language"] = language_hint
+
+    transcribe_coro = client.audio.transcriptions.create(**transcribe_kwargs)
     translate_coro = client.audio.translations.create(
         file=(filename, audio_bytes, content_type),
         model=_TRANSLATE_MODEL,
@@ -70,7 +75,7 @@ async def transcribe_audio(
     detected_language = (
         getattr(transcribe_result, "language", None) or "unknown"
     ).lower()
-    language = normalize_supported_language(detected_language)
+    language = language_hint if language_hint in {"en", "ur"} else normalize_supported_language(detected_language)
 
     if not text:
         raise SpeechToTextError("Groq STT returned an empty transcript.")
@@ -91,7 +96,9 @@ async def transcribe_audio(
 
 
 def normalize_supported_language(language: str) -> str:
-    normalized = language.lower().split("-")[0].split("_")[0]
-    if normalized == "en":
+    normalized = language.lower().strip().split("-")[0].split("_")[0]
+    if normalized in {"en", "eng", "english"}:
         return "en"
+    if normalized in {"ur", "urd", "urdu"}:
+        return "ur"
     return "ur"
