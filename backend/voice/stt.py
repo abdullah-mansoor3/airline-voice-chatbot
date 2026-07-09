@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass
 
 from groq import AsyncGroq
+
+# Turbo is faster/cheaper for transcription; only the full v3 model supports translate.
+_TRANSCRIBE_MODEL = "whisper-large-v3-turbo"
+_TRANSLATE_MODEL = "whisper-large-v3"
 
 
 class SpeechToTextError(RuntimeError):
@@ -13,8 +18,14 @@ class SpeechToTextError(RuntimeError):
 @dataclass(frozen=True)
 class TranscriptionResult:
     text: str
+    """Native-script transcript (Urdu in Nastaliq, English, or code-switched)."""
     language: str
+    """Normalised two-letter code: 'ur' or 'en'."""
     detected_language: str
+    """Raw language tag returned by Whisper (e.g. 'urdu', 'english')."""
+    english_text: str | None = None
+    """English translation from the parallel translate call.
+    None when Whisper already transcribed in English (no translation needed)."""
 
 
 async def transcribe_audio(
@@ -23,32 +34,59 @@ async def transcribe_audio(
     filename: str,
     content_type: str,
 ) -> TranscriptionResult:
+    """Fire ``transcribe`` and ``translate`` in parallel on the same audio buffer.
+
+    - ``transcribe`` returns the native-script text plus Whisper's detected language.
+    - ``translate`` always returns English regardless of source language.
+
+    If Whisper already detected English the translate result is redundant, so we
+    skip storing it separately (set ``english_text = None`` and use ``text`` directly).
+    """
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         raise SpeechToTextError("GROQ_API_KEY is missing; cannot transcribe audio.")
 
     client = AsyncGroq(api_key=api_key)
 
+    transcribe_coro = client.audio.transcriptions.create(
+        file=(filename, audio_bytes, content_type),
+        model=_TRANSCRIBE_MODEL,
+        response_format="verbose_json",
+    )
+    translate_coro = client.audio.translations.create(
+        file=(filename, audio_bytes, content_type),
+        model=_TRANSLATE_MODEL,
+        response_format="verbose_json",
+    )
+
     try:
-        result = await client.audio.transcriptions.create(
-            file=(filename, audio_bytes, content_type),
-            model="whisper-large-v3-turbo",
-            response_format="verbose_json",
+        transcribe_result, translate_result = await asyncio.gather(
+            transcribe_coro, translate_coro
         )
-    except Exception as exc:  # SDK exceptions vary by transport/version.
+    except Exception as exc:
         raise SpeechToTextError(f"Groq STT failed: {exc}") from exc
 
-    text = (getattr(result, "text", None) or "").strip()
-    detected_language = (getattr(result, "language", None) or "unknown").lower()
+    text = (getattr(transcribe_result, "text", None) or "").strip()
+    detected_language = (
+        getattr(transcribe_result, "language", None) or "unknown"
+    ).lower()
     language = normalize_supported_language(detected_language)
 
     if not text:
         raise SpeechToTextError("Groq STT returned an empty transcript.")
 
+    # If already English, the translation is the same text — skip redundant storage.
+    english_text: str | None = (
+        getattr(translate_result, "text", None) or ""
+    ).strip() or None
+    if language == "en":
+        english_text = None
+
     return TranscriptionResult(
         text=text,
         language=language,
         detected_language=detected_language,
+        english_text=english_text,
     )
 
 

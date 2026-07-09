@@ -4,7 +4,20 @@ create table if not exists public.users (
   id uuid primary key references auth.users(id) on delete cascade,
   full_name text,
   phone text,
-  preferred_language text
+  preferred_language text,
+  role text not null default 'user' check (role in ('user', 'admin'))
+);
+
+create table if not exists public.conversations (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.users(id) on delete cascade,
+  title text,
+  status text not null default 'active' check (
+    status in ('active', 'closed', 'escalated')
+  ),
+  primary_language text,
+  started_at timestamp with time zone not null default now(),
+  last_message_at timestamp with time zone not null default now()
 );
 
 create table if not exists public.orders (
@@ -21,6 +34,7 @@ create table if not exists public.disputes (
   id uuid primary key default gen_random_uuid(),
   user_id uuid references public.users(id) on delete cascade,
   order_id uuid references public.orders(id) on delete set null,
+  conversation_id uuid references public.conversations(id) on delete set null,
   claim_type text,
   detected_language text,
   status text,
@@ -44,13 +58,17 @@ create table if not exists public.policy_chunks (
   chunk_text text not null
 );
 
-create table if not exists public.dispute_transcripts (
+create table if not exists public.messages (
   id uuid primary key default gen_random_uuid(),
-  dispute_id uuid not null references public.disputes(id) on delete cascade,
+  conversation_id uuid not null references public.conversations(id) on delete cascade,
+  dispute_id uuid references public.disputes(id) on delete set null,
   turn_index int not null,
   speaker text not null check (speaker in ('user', 'agent')),
   original_text text,
-  english_text text
+  english_text text,
+  audio_url text,
+  created_at timestamp with time zone not null default now(),
+  unique (conversation_id, turn_index, speaker)
 );
 
 create table if not exists public.dispute_actions (
@@ -72,39 +90,136 @@ create table if not exists public.dispute_action_citations (
 );
 
 alter table public.users enable row level security;
+alter table public.conversations enable row level security;
 alter table public.orders enable row level security;
 alter table public.disputes enable row level security;
-alter table public.dispute_transcripts enable row level security;
+alter table public.messages enable row level security;
 alter table public.dispute_actions enable row level security;
 alter table public.dispute_action_citations enable row level security;
 alter table public.policy_documents enable row level security;
 alter table public.policy_chunks enable row level security;
 
+-- Grant table-level permissions to Supabase roles.
+-- Tables created via SQL Editor (not the UI) don't get these automatically.
+-- service_role bypasses RLS but still needs table-level GRANT.
+grant usage on schema public to anon, authenticated, service_role;
+
+grant all on all tables    in schema public to service_role;
+grant all on all sequences in schema public to service_role;
+
+grant select, insert, update, delete on all tables    in schema public to authenticated;
+grant usage, select                  on all sequences in schema public to authenticated;
+
+grant select on all tables in schema public to anon;
+
+create or replace function public.is_admin()
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.users
+    where users.id = auth.uid()
+      and users.role = 'admin'
+  );
+$$;
+
+create or replace function public.handle_new_auth_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  insert into public.users (id, full_name, phone, preferred_language)
+  values (
+    new.id,
+    coalesce(new.raw_user_meta_data->>'full_name', new.raw_user_meta_data->>'name'),
+    new.phone,
+    new.raw_user_meta_data->>'preferred_language'
+  )
+  on conflict (id) do nothing;
+
+  return new;
+end;
+$$;
+
+create or replace function public.prevent_user_role_escalation()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if new.role is distinct from old.role
+    and coalesce(auth.jwt()->>'role', '') <> 'service_role'
+    and current_user not in ('postgres', 'supabase_admin')
+    and not public.is_admin()
+  then
+    raise exception 'Only admins can change user roles.';
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.handle_new_auth_user();
+
+drop trigger if exists prevent_user_role_escalation on public.users;
+create trigger prevent_user_role_escalation
+  before update of role on public.users
+  for each row execute function public.prevent_user_role_escalation();
+
 create policy "users can read own profile"
   on public.users for select
-  using (auth.uid() = id);
+  using (auth.uid() = id or public.is_admin());
 
 create policy "users can update own profile"
   on public.users for update
   using (auth.uid() = id)
   with check (auth.uid() = id);
 
+create policy "admins can manage profiles"
+  on public.users for all
+  using (public.is_admin())
+  with check (public.is_admin());
+
+create policy "users can read own conversations"
+  on public.conversations for select
+  using (auth.uid() = user_id or public.is_admin());
+
+create policy "users can create own conversations"
+  on public.conversations for insert
+  with check (auth.uid() = user_id);
+
+create policy "users can update own conversations"
+  on public.conversations for update
+  using (auth.uid() = user_id or public.is_admin())
+  with check (auth.uid() = user_id or public.is_admin());
+
 create policy "users can read own orders"
   on public.orders for select
-  using (auth.uid() = user_id);
+  using (auth.uid() = user_id or public.is_admin());
 
 create policy "users can read own disputes"
   on public.disputes for select
-  using (auth.uid() = user_id);
+  using (auth.uid() = user_id or public.is_admin());
 
-create policy "users can read own transcripts"
-  on public.dispute_transcripts for select
+create policy "users can read own messages"
+  on public.messages for select
   using (
     exists (
-      select 1 from public.disputes
-      where disputes.id = dispute_transcripts.dispute_id
-        and disputes.user_id = auth.uid()
+      select 1 from public.conversations
+      where conversations.id = messages.conversation_id
+        and conversations.user_id = auth.uid()
     )
+    or public.is_admin()
   );
 
 create policy "users can read own actions"
@@ -115,6 +230,7 @@ create policy "users can read own actions"
       where disputes.id = dispute_actions.dispute_id
         and disputes.user_id = auth.uid()
     )
+    or public.is_admin()
   );
 
 create policy "users can read own action citations"
@@ -127,6 +243,7 @@ create policy "users can read own action citations"
       where dispute_actions.id = dispute_action_citations.action_id
         and disputes.user_id = auth.uid()
     )
+    or public.is_admin()
   );
 
 create policy "policy documents are readable"
@@ -136,3 +253,6 @@ create policy "policy documents are readable"
 create policy "policy chunks are readable"
   on public.policy_chunks for select
   using (true);
+
+-- Create the admin in Supabase Auth first, then promote that profile with the service role:
+-- update public.users set role = 'admin' where id = '<admin-auth-user-uuid>';
