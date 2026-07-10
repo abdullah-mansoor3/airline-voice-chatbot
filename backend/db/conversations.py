@@ -17,13 +17,22 @@ class ConversationContext:
     user_id: str
 
 
-async def get_or_create_conversation(
-    *, user_id: str, conversation_id: str | None = None
+async def get_conversation(
+    *, user_id: str, conversation_id: str
 ) -> ConversationContext:
     return await asyncio.to_thread(
-        _get_or_create_conversation_sync,
+        _get_conversation_sync,
         user_id,
         conversation_id,
+    )
+
+async def create_conversation(
+    *, user_id: str, title: str = "New conversation"
+) -> ConversationContext:
+    return await asyncio.to_thread(
+        _create_conversation_sync,
+        user_id,
+        title,
     )
 
 
@@ -53,30 +62,31 @@ async def record_turn(
     )
 
 
-def _get_or_create_conversation_sync(
-    user_id: str, conversation_id: str | None
+def _get_conversation_sync(
+    user_id: str, conversation_id: str
 ) -> ConversationContext:
     client = get_service_supabase_client()
+    response = (
+        client.table("conversations")
+        .select("id,user_id")
+        .eq("id", conversation_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if response.data:
+        return ConversationContext(id=response.data[0]["id"], user_id=user_id)
+    raise ConversationHistoryError("Conversation was not found for this user.")
 
-    if conversation_id:
-        response = (
-            client.table("conversations")
-            .select("id,user_id")
-            .eq("id", conversation_id)
-            .eq("user_id", user_id)
-            .limit(1)
-            .execute()
-        )
-        if response.data:
-            return ConversationContext(id=response.data[0]["id"], user_id=user_id)
-        raise ConversationHistoryError("Conversation was not found for this user.")
 
+def _create_conversation_sync(user_id: str, title: str) -> ConversationContext:
+    client = get_service_supabase_client()
     response = (
         client.table("conversations")
         .insert(
             {
                 "user_id": user_id,
-                "title": _unique_conversation_title(client, user_id, "New conversation"),
+                "title": _unique_conversation_title(client, user_id, title),
                 "status": "active",
                 "primary_language": "ur",
             }

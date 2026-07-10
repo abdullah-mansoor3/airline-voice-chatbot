@@ -73,6 +73,15 @@ create table if not exists public.orders (
   updated_at timestamp with time zone not null default now()
 );
 
+alter table public.orders
+  add column if not exists booking_reference text,
+  add column if not exists airline text,
+  add column if not exists origin text,
+  add column if not exists destination text,
+  add column if not exists departure_date date,
+  add column if not exists raw_payload jsonb,
+  add column if not exists updated_at timestamp with time zone not null default now();
+
 do $$
 begin
   if not exists (
@@ -93,15 +102,6 @@ begin
       add constraint orders_user_booking_reference_key unique (user_id, booking_reference);
   end if;
 end $$;
-
-alter table public.orders
-  add column if not exists booking_reference text,
-  add column if not exists airline text,
-  add column if not exists origin text,
-  add column if not exists destination text,
-  add column if not exists departure_date date,
-  add column if not exists raw_payload jsonb,
-  add column if not exists updated_at timestamp with time zone not null default now();
 
 create table if not exists public.user_memories (
   id uuid primary key default gen_random_uuid(),

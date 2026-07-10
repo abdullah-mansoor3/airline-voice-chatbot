@@ -49,16 +49,19 @@ async def update_memory_after_turn(
 def _load_memory_context_sync(conversation: ConversationContext) -> MemoryContext:
     client = get_service_supabase_client()
 
-    convo = (
-        client.table("conversations")
-        .select("short_term_summary")
-        .eq("id", conversation.id)
-        .limit(1)
-        .execute()
-    )
     short_summary = None
-    if convo.data:
-        short_summary = convo.data[0].get("short_term_summary")
+    try:
+        convo = (
+            client.table("conversations")
+            .select("short_term_summary")
+            .eq("id", conversation.id)
+            .limit(1)
+            .execute()
+        )
+        if convo.data:
+            short_summary = convo.data[0].get("short_term_summary")
+    except Exception:
+        pass  # Column likely doesn't exist yet
 
     messages = (
         client.table("messages")
@@ -103,24 +106,27 @@ def _update_memory_after_turn_sync(
     agent_text: str,
 ) -> None:
     client = get_service_supabase_client()
-    previous = (
-        client.table("conversations")
-        .select("short_term_summary")
-        .eq("id", conversation.id)
-        .limit(1)
-        .execute()
-    )
-    previous_summary = ""
-    if previous.data:
-        previous_summary = previous.data[0].get("short_term_summary") or ""
+    try:
+        previous = (
+            client.table("conversations")
+            .select("short_term_summary")
+            .eq("id", conversation.id)
+            .limit(1)
+            .execute()
+        )
+        previous_summary = ""
+        if previous.data:
+            previous_summary = previous.data[0].get("short_term_summary") or ""
 
-    summary = _roll_summary(previous_summary, user_text=user_text, agent_text=agent_text)
-    client.table("conversations").update(
-        {
-            "short_term_summary": summary,
-            "memory_updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-    ).eq("id", conversation.id).execute()
+        summary = _roll_summary(previous_summary, user_text=user_text, agent_text=agent_text)
+        client.table("conversations").update(
+            {
+                "short_term_summary": summary,
+                "memory_updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ).eq("id", conversation.id).execute()
+    except Exception:
+        pass  # Column likely doesn't exist yet
 
     for memory_key, memory_value in _extract_long_term_facts(user_text, user_language):
         _upsert_memory(

@@ -13,28 +13,21 @@ type RecordingState = "idle" | "recording" | "processing";
 type LanguageMode = "auto" | "en" | "ur";
 
 type ServerEvent =
-  | { type: "ready"; userId: string; conversationId: string }
+  | { type: "ready"; userId: string; conversationId: string | null }
+  | { type: "conversation_created"; conversationId: string }
   | { type: "auth_required"; message: string }
   | { type: "recording_started" }
   | { type: "processing"; stage: "stt" | "agent" | "tts" }
-  | {
-      type: "transcript";
-      text: string;
-      englishText?: string | null;
-      language: string;
-      detectedLanguage?: string;
-    }
-  | {
-      type: "agent_response";
-      text: string;
-      language: string;
-      citations?: Citation[];
-    }
+  | { type: "transcript"; text: string; englishText?: string | null; language: string; detectedLanguage?: string }
+  | { type: "agent_response"; text: string; language: string; citations?: Citation[] }
+  | { type: "agent_token"; text: string }
   | { type: "tts_audio"; mimeType: string; bytes: number }
   | { type: "turn_complete" }
   | { type: "cancelled" }
   | { type: "error"; message: string }
-  | { type: "pong" };
+  | { type: "pong" }
+  | { type: "debug_trace"; entry: Record<string, unknown> }
+  | { type: "debug_memory"; memory: Record<string, unknown> };
 
 type ConversationSummary = {
   id: string;
@@ -60,6 +53,7 @@ type Message = {
   language: string;
   citations?: Citation[];
   timestamp: Date;
+  isStreaming?: boolean;
 };
 
 type Citation = {
@@ -78,9 +72,9 @@ const wsUrl = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:8000/ws/voice";
 const apiUrl = wsUrl.replace(/^ws/, "http").replace(/\/ws\/voice$/, "");
 
 // VAD settings (must match backend VadSettings defaults)
-const VAD_SILENCE_MS = 900;
-const VAD_ENERGY_THRESHOLD = 0.015;
-const VAD_BARGE_IN_THRESHOLD = 0.020;
+const VAD_SILENCE_MS = 800;
+const VAD_ENERGY_THRESHOLD = 0.045;
+const VAD_BARGE_IN_THRESHOLD = 0.050;
 const VAD_MIN_SPEECH_MS = 300;
 
 // ── Main Component ───────────────────────────────────────────────────────────
@@ -95,6 +89,7 @@ export default function Home() {
   const [authMode, setAuthMode] = useState<"signin" | "signup">("signin");
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [conversationId, setConversationId] = useState<string | null>(null);
+  const [connectionKey, setConnectionKey] = useState(0);
   const [messages, setMessages] = useState<Message[]>([]);
   const [currentTranscript, setCurrentTranscript] = useState("");
   const [currentResponse, setCurrentResponse] = useState("");
@@ -103,10 +98,14 @@ export default function Home() {
   const [languageMode, setLanguageMode] = useState<LanguageMode>("auto");
   const [conversationMode, setConversationMode] = useState(false);
   const [error, setError] = useState("");
-  const [vadVolume, setVadVolume] = useState(0); // 0-1 for visualiser
+  const [vadVolume, setVadVolume] = useState(0);
   const [isPlayingTts, setIsPlayingTts] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [adminTab, setAdminTab] = useState<"debug" | "memory" | "users">("debug");
+  const [debugTrace, setDebugTrace] = useState<Record<string, unknown>[]>([]);
+  const [debugMemory, setDebugMemory] = useState<Record<string, unknown> | null>(null);
+  const [adminDbData, setAdminDbData] = useState<Record<string, unknown> | null>(null);
 
-  // Refs — stable across renders
   const wsRef = useRef<WebSocket | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -129,6 +128,8 @@ export default function Home() {
   const sessionRef = useRef<Session | null>(null);
   const nextExpectedBytesRef = useRef<number | null>(null);
   const messageFeedRef = useRef<HTMLDivElement | null>(null);
+  const conversationIdRef = useRef<string | null>(null);
+  const isAdminRef = useRef(false);
 
   // ── Auth ───────────────────────────────────────────────────────────────────
 
@@ -138,7 +139,20 @@ export default function Home() {
 
   useEffect(() => {
     conversationModeRef.current = conversationMode;
+    // When user enables hands-free, immediately start listening
+    if (conversationMode && connectionRef.current === "connected" && sessionRef.current && recordingStateRef.current === "idle") {
+      pendingAutoListenRef.current = true;
+      maybeAutoListen();
+    }
+    // When user disables hands-free while recording, stop
+    if (!conversationMode && recorderRef.current && recorderRef.current.state !== "inactive") {
+      stopRecording();
+    }
   }, [conversationMode]);
+
+  useEffect(() => {
+    conversationIdRef.current = conversationId;
+  }, [conversationId]);
 
   useEffect(() => {
     recordingStateRef.current = recordingState;
@@ -185,7 +199,7 @@ export default function Home() {
         JSON.stringify({
           type: "auth",
           accessToken: session.access_token,
-          conversationId,
+          conversationId: conversationIdRef.current,
         }),
       );
     };
@@ -218,7 +232,7 @@ export default function Home() {
       stopStream();
       clearPlayback();
     };
-  }, [session, conversationId]);
+  }, [session, connectionKey]);
 
   useEffect(() => {
     if (!session || !conversationId) return;
@@ -286,6 +300,19 @@ export default function Home() {
         setStatus("Ready");
         setConversationId(event.conversationId);
         loadConversations();
+        // Check admin role
+        fetch(`${apiUrl}/admin/debug`, {
+          headers: { Authorization: `Bearer ${sessionRef.current?.access_token}` },
+        }).then(r => {
+          if (r.ok) {
+            r.json().then(d => { setIsAdmin(true); isAdminRef.current = true; setAdminDbData(d); });
+          }
+        }).catch(() => {});
+        break;
+
+      case "conversation_created":
+        setConversationId(event.conversationId);
+        loadConversations();
         break;
 
       case "auth_required":
@@ -324,19 +351,52 @@ export default function Home() {
         ]);
         break;
 
+      case "agent_token":
+        setMessages((prev) => {
+          const newMsgs = [...prev];
+          const lastMsg = newMsgs[newMsgs.length - 1];
+          if (lastMsg && lastMsg.speaker === "agent" && lastMsg.isStreaming) {
+            newMsgs[newMsgs.length - 1] = {
+              ...lastMsg,
+              text: lastMsg.text + event.text
+            };
+            return newMsgs;
+          } else {
+            newMsgs.push({
+              id: crypto.randomUUID(),
+              speaker: "agent",
+              text: event.text,
+              language: "ur",
+              timestamp: new Date(),
+              isStreaming: true,
+            });
+            return newMsgs;
+          }
+        });
+        break;
+
       case "agent_response":
         setCurrentResponse(event.text);
-        setMessages((prev) => [
-          ...prev,
-          {
+        setMessages((prev) => {
+          const newMsgs = [...prev];
+          const lastMsg = newMsgs[newMsgs.length - 1];
+          if (lastMsg && lastMsg.speaker === "agent" && lastMsg.isStreaming) {
+            lastMsg.isStreaming = false;
+            lastMsg.text = event.text;
+            lastMsg.language = event.language;
+            lastMsg.citations = event.citations;
+            return newMsgs;
+          }
+          newMsgs.push({
             id: crypto.randomUUID(),
             speaker: "agent",
             text: event.text,
             language: event.language,
             citations: event.citations,
             timestamp: new Date(),
-          },
-        ]);
+          });
+          return newMsgs;
+        });
         break;
 
       case "tts_audio":
@@ -347,7 +407,8 @@ export default function Home() {
       case "turn_complete":
         setStatus("Ready");
         setRecordingState("idle");
-        if (lastTurnWasVoiceRef.current && conversationModeRef.current) {
+        // In hands-free mode auto-listen after any turn (voice or text)
+        if (conversationModeRef.current) {
           pendingAutoListenRef.current = true;
         }
         if (!isPlayingRef.current && audioQueueRef.current.length === 0) {
@@ -358,7 +419,6 @@ export default function Home() {
         break;
 
       case "cancelled":
-        // Barge-in acknowledged — clear audio queue.
         clearPlayback();
         pendingAutoListenRef.current = false;
         setStatus("Ready");
@@ -369,6 +429,14 @@ export default function Home() {
         setError(event.message);
         setStatus("Ready");
         setRecordingState("idle");
+        break;
+
+      case "debug_trace":
+        setDebugTrace(prev => [...prev, event.entry]);
+        break;
+
+      case "debug_memory":
+        setDebugMemory(event.memory);
         break;
     }
   }
@@ -556,6 +624,7 @@ export default function Home() {
     setTextDraft("");
     setRecordingState("processing");
     lastTurnWasVoiceRef.current = false;
+    
     socket.send(JSON.stringify({ type: "text_message", text, languageMode }));
   }
 
@@ -569,15 +638,17 @@ export default function Home() {
       return;
     }
     pendingAutoListenRef.current = false;
+    // Small delay to let TTS finish and AudioContext drain
     window.setTimeout(() => {
       if (
         conversationModeRef.current &&
         recordingStateRef.current === "idle" &&
+        !isPlayingRef.current &&
         wsRef.current?.readyState === WebSocket.OPEN
       ) {
         startRecording();
       }
-    }, 350);
+    }, 500);
   }
 
   // ── Auth Actions ──────────────────────────────────────────────────────────
@@ -624,24 +695,37 @@ export default function Home() {
   async function deleteConversation(id: string) {
     setError("");
     if (!session) return;
+    
+    const convoToRestore = conversations.find((c) => c.id === id);
+    setConversations((prev) => prev.filter((c) => c.id !== id));
+    
+    if (conversationId === id) {
+      setConversationId(null);
+      setConnectionKey((k) => k + 1);
+      setMessages([]);
+      setCurrentTranscript("");
+      setCurrentResponse("");
+    }
+
     const response = await fetch(`${apiUrl}/conversations/${id}`, {
       method: "DELETE",
       headers: {
         Authorization: `Bearer ${session.access_token}`,
       },
     });
+    
     if (!response.ok) {
       const message = await response.text();
       setError(message || "Could not delete conversation.");
+      if (convoToRestore) {
+        setConversations((prev) => {
+          const restored = [convoToRestore, ...prev];
+          restored.sort((a, b) => new Date(b.last_message_at || 0).getTime() - new Date(a.last_message_at || 0).getTime());
+          return restored;
+        });
+      }
       return;
     }
-    if (conversationId === id) {
-      setConversationId(null);
-      setMessages([]);
-      setCurrentTranscript("");
-      setCurrentResponse("");
-    }
-    setConversations((prev) => prev.filter((conversation) => conversation.id !== id));
   }
 
   async function loadMessages(id: string) {
@@ -656,8 +740,8 @@ export default function Home() {
       return;
     }
 
-    setMessages(
-      ((data ?? []) as StoredMessage[]).map((message) => {
+    setMessages((prev) => {
+      const dbMessages = ((data ?? []) as StoredMessage[]).map((message) => {
         const text = message.original_text ?? "";
         return {
           id: message.id,
@@ -667,19 +751,28 @@ export default function Home() {
           language: detectTextLanguage(text),
           timestamp: message.created_at ? new Date(message.created_at) : new Date(),
         };
-      }),
-    );
+      });
+      
+      if (dbMessages.length === 0 && prev.length > 0) {
+        return prev;
+      }
+      return dbMessages;
+    });
   }
 
   function selectConversation(id: string) {
+    if (conversationId === id) return;
     setConversationId(id);
+    setConnectionKey((k) => k + 1);
     setMessages([]);
     setCurrentTranscript("");
     setCurrentResponse("");
   }
 
   function startNewConversation() {
+    if (conversationId === null) return;
     setConversationId(null);
+    setConnectionKey((k) => k + 1);
     setMessages([]);
     setCurrentTranscript("");
     setCurrentResponse("");
@@ -858,36 +951,75 @@ export default function Home() {
           </section>
         )}
 
-        {/* Dev utilities */}
-        {session && (
-          <div className="devTools">
-            <button
-              id="test-tts-btn"
-              className="btnGhost"
-              disabled={isRecording}
-              onClick={testUrduTts}
-              type="button"
-            >
-              Test Urdu TTS
-            </button>
-          </div>
+        {/* ── Admin Debug Panel ── */}
+        {isAdmin && (
+          <section className="adminSection">
+            <div className="sidebarHeading">🔐 Admin Panel</div>
+            <div className="adminTabs">
+              {(["debug", "memory", "users"] as const).map((t) => (
+                <button
+                  key={t}
+                  className={`adminTabBtn ${adminTab === t ? "active" : ""}`}
+                  onClick={() => setAdminTab(t)}
+                  type="button"
+                >
+                  {t === "debug" ? "Trace" : t === "memory" ? "Memory" : "DB"}
+                </button>
+              ))}
+            </div>
+
+            {adminTab === "debug" && (
+              <div className="adminPane">
+                <div className="adminPaneHeader">
+                  Agent Trace
+                  <button className="adminClearBtn" onClick={() => setDebugTrace([])} type="button">Clear</button>
+                </div>
+                {debugTrace.length === 0 ? (
+                  <p className="adminEmpty">Send a message to see the trace.</p>
+                ) : (
+                  <div className="adminTraceList">
+                    {debugTrace.map((entry, i) => (
+                      <details key={i} className="adminTraceEntry">
+                        <summary className="adminTraceSummary">
+                          <span className="adminNodeTag">{String(entry.node ?? "node")}</span>
+                          {entry.tools_called ? ` → [${(entry.tools_called as string[]).join(", ")}]` : ""}
+                        </summary>
+                        <pre className="adminTracePre">{JSON.stringify(entry, null, 2)}</pre>
+                      </details>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {adminTab === "memory" && (
+              <div className="adminPane">
+                <div className="adminPaneHeader">Last Turn Memory</div>
+                {debugMemory ? (
+                  <pre className="adminTracePre">{JSON.stringify(debugMemory, null, 2)}</pre>
+                ) : (
+                  <p className="adminEmpty">No memory captured yet.</p>
+                )}
+              </div>
+            )}
+
+            {adminTab === "users" && (
+              <div className="adminPane">
+                <div className="adminPaneHeader">Database Snapshot</div>
+                {adminDbData ? (
+                  <pre className="adminTracePre">{JSON.stringify(adminDbData, null, 2)}</pre>
+                ) : (
+                  <p className="adminEmpty">Loading…</p>
+                )}
+              </div>
+            )}
+          </section>
         )}
+
       </aside>
 
       {/* ── Main ── */}
       <main className="main">
-        <header className="mainHeader">
-          <div>
-            <p className="eyebrow">Bilingual voice dispute resolution</p>
-            <h1 className="mainTitle">Claim Intake</h1>
-          </div>
-          {detectedLanguage && (
-            <span className="langBadge">
-              {detectedLanguage === "ur" ? "🇵🇰 Urdu" : "🇬🇧 English"}
-            </span>
-          )}
-        </header>
-
         {/* Error banner */}
         {error && (
           <div className="errorBanner" role="alert">
@@ -929,11 +1061,7 @@ export default function Home() {
                   {msg.text}
                 </ReactMarkdown>
               </div>
-              {msg.englishText && msg.language !== "en" && (
-                <div className="bubbleTranslation">
-                  <span className="translationLabel">English:</span> {msg.englishText}
-                </div>
-              )}
+
               {msg.speaker === "agent" && msg.citations?.length ? (
                 <div className="citations" dir="ltr">
                   <div className="citationTitle">Retrieved clauses</div>
@@ -1044,11 +1172,19 @@ export default function Home() {
               ? "Sign in to start a claim."
               : !isConnected
                 ? "Reconnecting…"
-                : isRecording
-                  ? "Listening… silence will auto-stop."
-                : isProcessing
-                    ? "Generating…"
-                    : "Ready."}
+                : conversationMode && isRecording
+                  ? "🎙 Listening… speak naturally, silence auto-stops."
+                  : conversationMode && isProcessing
+                    ? "💬 Generating…"
+                    : conversationMode && isPlayingTts
+                      ? "🔊 Speaking… talk to interrupt."
+                      : conversationMode
+                        ? "👂 Hands-free — waiting to auto-listen…"
+                        : isRecording
+                          ? "Listening… silence will auto-stop."
+                          : isProcessing
+                            ? "Generating…"
+                            : "Ready."}
           </p>
         </footer>
       </main>

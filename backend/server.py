@@ -22,7 +22,8 @@ from .db.auth import AuthError, verify_supabase_access_token
 from .db.conversations import (
     ConversationContext,
     ConversationHistoryError,
-    get_or_create_conversation,
+    get_conversation,
+    create_conversation,
     record_turn,
 )
 from .db.memory import load_memory_context, update_memory_after_turn
@@ -107,6 +108,30 @@ async def delete_conversation(
     return {"status": "deleted"}
 
 
+@app.get("/admin/debug")
+async def admin_debug_info(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Admin-only endpoint. Returns all users, memories, and conversations.
+    Role is checked server-side against the DB — clients cannot self-elevate.
+    """
+    token = _bearer_token(authorization)
+    try:
+        user = await verify_supabase_access_token(token)
+    except AuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+    svc = get_service_supabase_client()
+    profile = svc.table("users").select("role").eq("id", user.id).limit(1).execute()
+    if not profile.data or profile.data[0].get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden: admin access only.")
+
+    users = svc.table("users").select("id,full_name,role,preferred_language").execute().data or []
+    memories = svc.table("user_memories").select("*").order("last_seen_at", desc=True).limit(100).execute().data or []
+    conversations = svc.table("conversations").select("id,user_id,title,status,primary_language,last_message_at").order("last_message_at", desc=True).limit(50).execute().data or []
+    return {"users": users, "memories": memories, "conversations": conversations}
+
+
 @app.post("/orders/local")
 async def create_local_order(
     order: LocalOrderCreate,
@@ -141,10 +166,11 @@ async def voice_websocket(websocket: WebSocket) -> None:
         try:
             auth_event = await _receive_auth_event(websocket)
             user = await verify_supabase_access_token(auth_event.get("accessToken"))
-            conversation = await get_or_create_conversation(
-                user_id=user.id,
-                conversation_id=auth_event.get("conversationId"),
-            )
+            cid = auth_event.get("conversationId")
+            if cid:
+                conversation = await get_conversation(user_id=user.id, conversation_id=cid)
+            else:
+                conversation = None
         except (AuthError, ConversationHistoryError) as exc:
             await websocket.send_json({"type": "auth_required", "message": str(exc)})
             await websocket.close(code=1008)
@@ -154,9 +180,27 @@ async def voice_websocket(websocket: WebSocket) -> None:
             {
                 "type": "ready",
                 "userId": user.id,
-                "conversationId": conversation.id,
+                "conversationId": conversation.id if conversation else None,
             }
         )
+
+        class SessionContext:
+            def __init__(self, conv, u, admin: bool = False):
+                self.conversation = conv
+                self.user = u
+                self.is_admin = admin
+
+        # Check admin role via service client
+        is_admin = False
+        try:
+            svc = get_service_supabase_client()
+            profile = svc.table("users").select("role").eq("id", user.id).limit(1).execute()
+            if profile.data and profile.data[0].get("role") == "admin":
+                is_admin = True
+        except Exception:
+            pass
+
+        session = SessionContext(conversation, user, admin=is_admin)
 
         while True:
             message = await websocket.receive()
@@ -199,9 +243,10 @@ async def voice_websocket(websocket: WebSocket) -> None:
                         websocket,
                         bytes(audio_buffer),
                         mime_type,
-                        conversation,
+                        session,
                         tts_cancel_event,
                         language_hint,
+                        is_admin=session.is_admin,
                     )
                 )
                 audio_buffer = bytearray()
@@ -224,8 +269,9 @@ async def voice_websocket(websocket: WebSocket) -> None:
                     _handle_text_turn(
                         websocket,
                         text,
-                        conversation,
+                        session,
                         _language_hint_from_event(event),
+                        is_admin=session.is_admin,
                     )
                 )
                 continue
@@ -255,9 +301,11 @@ def _consume_task_result(task: asyncio.Task[None]) -> None:
     try:
         task.result()
     except asyncio.CancelledError:
-        return
-    except Exception:
-        return
+        pass
+    except Exception as exc:
+        import traceback
+        print("Task failed with exception:")
+        traceback.print_exc()
 
 
 async def _receive_auth_event(websocket: WebSocket) -> dict[str, Any]:
@@ -279,9 +327,14 @@ async def _receive_auth_event(websocket: WebSocket) -> dict[str, Any]:
 async def _handle_text_turn(
     websocket: WebSocket,
     text: str,
-    conversation: ConversationContext,
+    session: Any,
     language_hint: str | None = None,
+    is_admin: bool = False,
 ) -> None:
+    if session.conversation is None:
+        session.conversation = await create_conversation(user_id=session.user.id, title=text[:80])
+        await websocket.send_json({"type": "conversation_created", "conversationId": session.conversation.id})
+    conversation = session.conversation
     language = language_hint or _detect_supported_text_language(text)
     await websocket.send_json({"type": "processing", "stage": "agent"})
     await websocket.send_json(
@@ -295,12 +348,27 @@ async def _handle_text_turn(
     )
 
     memory = await load_memory_context(conversation)
+
+    async def token_callback(delta: str):
+        if delta:
+            await websocket.send_json({"type": "agent_token", "text": delta})
+
+    async def debug_callback(trace_entry: dict):
+        if is_admin:
+            await websocket.send_json({"type": "debug_trace", "entry": trace_entry})
+
     agent_result = await run_agent_turn(
         text,
         language,
         user_id=conversation.user_id,
         memory_context=memory.for_prompt(),
+        token_callback=token_callback,
+        debug_callback=debug_callback if is_admin else None,
     )
+
+    if is_admin:
+        await websocket.send_json({"type": "debug_memory", "memory": memory.for_prompt()})
+
     await websocket.send_json(
         {
             "type": "agent_response",
@@ -337,9 +405,10 @@ async def _handle_turn(
     websocket: WebSocket,
     audio_bytes: bytes,
     mime_type: str,
-    conversation: ConversationContext,
+    session: Any,
     cancel_event: asyncio.Event,
     language_hint: str | None = None,
+    is_admin: bool = False,
 ) -> None:
     if not audio_bytes:
         await websocket.send_json(
@@ -350,7 +419,6 @@ async def _handle_turn(
     await websocket.send_json({"type": "processing", "stage": "stt"})
 
     try:
-        # Phase 2: parallel transcribe + translate.
         stt_result = await transcribe_audio(
             audio_bytes,
             filename=f"claim.{_extension_for_mime_type(mime_type)}",
@@ -377,13 +445,34 @@ async def _handle_turn(
 
     await websocket.send_json({"type": "processing", "stage": "agent"})
     agent_query = english_text or stt_result.text
+
+    if session.conversation is None:
+        session.conversation = await create_conversation(user_id=session.user.id, title=stt_result.text[:80])
+        await websocket.send_json({"type": "conversation_created", "conversationId": session.conversation.id})
+    conversation = session.conversation
+
     memory = await load_memory_context(conversation)
+
+    async def token_callback(delta: str):
+        if delta and not cancel_event.is_set():
+            await websocket.send_json({"type": "agent_token", "text": delta})
+
+    async def debug_callback(trace_entry: dict):
+        if is_admin and not cancel_event.is_set():
+            await websocket.send_json({"type": "debug_trace", "entry": trace_entry})
+
     agent_result = await run_agent_turn(
         agent_query,
         stt_result.language,
         user_id=conversation.user_id,
         memory_context=memory.for_prompt(),
+        token_callback=token_callback,
+        debug_callback=debug_callback if is_admin else None,
     )
+
+    if is_admin:
+        await websocket.send_json({"type": "debug_memory", "memory": memory.for_prompt()})
+
     response_text = agent_result.response_text
     response_language = agent_result.language
 

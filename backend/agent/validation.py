@@ -36,6 +36,15 @@ PROMPT_INJECTION_PATTERNS = [
     r"developer\s+message",
     r"system\s+prompt",
     r"approve\s+(my\s+)?refund\s+no\s+matter",
+    r"do\s+not\s+validate",
+    r"skip\s+validation",
+    r"bypassing",
+    r"forget\s+all",
+    r"output\s+the\s+following",
+    r"print\s+(the\s+)?previous",
+    r"base64",
+    r"roleplay",
+    r"sudo",
 ]
 
 
@@ -58,6 +67,16 @@ def parse_and_validate_agent_output(
 ) -> ValidationResult:
     warnings: list[str] = []
     payload = _extract_json(raw_text)
+    
+    # Extract the markdown answer text (everything before the ```json block)
+    text_part = re.sub(r"```(?:json)?.*?```", "", raw_text, flags=re.DOTALL | re.IGNORECASE).strip()
+    # Fallback if no json block: just take the whole thing and strip {}
+    if not text_part:
+        text_part = re.sub(r"\{.*?\}", "", raw_text, flags=re.DOTALL).strip()
+    if not text_part:
+        text_part = raw_text.strip()
+    
+    payload["answer_markdown"] = text_part
     allowed_ids = {chunk.get("id") for chunk in retrieved_chunks if chunk.get("id")}
     retrieved_by_id = {
         chunk.get("id"): chunk for chunk in retrieved_chunks if chunk.get("id")
@@ -165,21 +184,26 @@ def _jurisdiction_mismatched_citations(
 
 def _extract_json(raw_text: str) -> dict[str, Any]:
     text = raw_text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
-        text = re.sub(r"```$", "", text).strip()
-    try:
-        parsed = json.loads(text)
-        return parsed if isinstance(parsed, dict) else {}
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if not match:
-            return {}
+    
+    # Try to find a JSON block specifically
+    block_match = re.search(r"```(?:json)?(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
+    if block_match:
+        json_str = block_match.group(1).strip()
         try:
-            parsed = json.loads(match.group(0))
+            parsed = json.loads(json_str)
             return parsed if isinstance(parsed, dict) else {}
         except json.JSONDecodeError:
-            return {}
+            pass
+
+    # Fallback to finding outermost curly braces
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        return {}
+    try:
+        parsed = json.loads(match.group(0))
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}
 
 
 def _fallback_answer(language: str) -> str:
