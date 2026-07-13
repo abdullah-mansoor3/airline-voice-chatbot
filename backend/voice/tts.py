@@ -37,7 +37,9 @@ _SENTENCE_SPLIT = re.compile(r"(?<=[.?!۔؟!])\s+")
 
 
 def _voice_for(language: str) -> str:
-    return VOICE_BY_LANGUAGE.get(language[:2], VOICE_BY_LANGUAGE["en"])
+    if language[:2] == "en":
+        return VOICE_BY_LANGUAGE["en"]
+    return VOICE_BY_LANGUAGE["ur"]
 
 
 async def synthesize_speech(text: str, language: str) -> bytes:

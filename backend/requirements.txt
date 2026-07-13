@@ -10,3 +10,4 @@ edge-tts
 python-dotenv
 pydantic
 httpx
+tzdata

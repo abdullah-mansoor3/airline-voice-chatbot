@@ -2,7 +2,20 @@ from __future__ import annotations
 
 from typing import Any
 
-from .duffel_client import DuffelClient
+from .duffel_client import DuffelClient, DuffelError
+
+
+def _friendly_flight_error(exc: Exception) -> str:
+    message = str(exc)
+    if "insufficient_permissions" in message or "air.offer_requests.create" in message:
+        return (
+            "Live flight search is not available right now because the Duffel API token "
+            "lacks offer-search permission. An admin must create a token with "
+            "'air.offer_requests.create' in the Duffel dashboard."
+        )
+    if "403" in message:
+        return "Live flight search is temporarily unavailable (Duffel access denied)."
+    return f"Flight search failed: {message}"
 
 
 async def search_alternative_flights(
@@ -13,13 +26,16 @@ async def search_alternative_flights(
     adults: int = 1,
     cabin_class: str = "economy",
 ) -> list[dict[str, Any]]:
-    response = await DuffelClient.from_env().create_offer_request(
-        origin=origin,
-        destination=destination,
-        departure_date=departure_date,
-        adults=adults,
-        cabin_class=cabin_class,
-    )
+    try:
+        response = await DuffelClient.from_env().create_offer_request(
+            origin=origin,
+            destination=destination,
+            departure_date=departure_date,
+            adults=adults,
+            cabin_class=cabin_class,
+        )
+    except DuffelError as exc:
+        return [{"error": _friendly_flight_error(exc)}]
     offer_request = response.get("data", {})
     offers = offer_request.get("offers") or []
     return [_normalize_offer(offer) for offer in offers[:10]]

@@ -9,9 +9,9 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "Airline Dispute Voice Agent",
+  title: "Claim Desk — Airline Assistant",
   description:
-    "Bilingual (Urdu/English) voice-driven dispute resolution agent for airline customer claims — refunds, cancellations, and delay compensation.",
+    "Bilingual airline dispute and policy assistant for refunds, baggage, cancellations, and flight questions.",
 };
 
 export default function RootLayout({

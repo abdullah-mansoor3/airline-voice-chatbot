@@ -44,7 +44,15 @@ Frontend:
 npm --prefix frontend run dev
 ```
 
-Then open `http://localhost:3000`.
+Then open `http://localhost:3000` for the landing page, `http://localhost:3000/login` to sign in,
+and `http://localhost:3000/chat` for the assistant.
+
+## Duffel flight search
+
+If flight search returns `insufficient_permissions` / 403, your Duffel API token is missing the
+`air.offer_requests.create` scope. In the [Duffel dashboard](https://app.duffel.com/api-keys),
+create or edit a token and enable **Offer requests → Create**. Update `DUFFEL_API_KEY` in `.env`
+and restart the backend.
 
 ## WebSocket Protocol
 

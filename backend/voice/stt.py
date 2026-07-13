@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from dataclasses import dataclass
 
 from groq import AsyncGroq
@@ -49,15 +50,16 @@ async def transcribe_audio(
 
     client = AsyncGroq(api_key=api_key)
 
-    transcribe_kwargs = {
+    transcribe_kwargs: dict[str, object] = {
         "file": (filename, audio_bytes, content_type),
         "model": _TRANSCRIBE_MODEL,
         "response_format": "verbose_json",
     }
-    if language_hint in {"en", "ur"}:
-        transcribe_kwargs["language"] = language_hint
+    if language_hint == "en":
+        transcribe_kwargs["language"] = "en"
+    elif language_hint == "ur":
+        transcribe_kwargs["language"] = "ur"
 
-    transcribe_coro = client.audio.transcriptions.create(**transcribe_kwargs)
     translate_coro = client.audio.translations.create(
         file=(filename, audio_bytes, content_type),
         model=_TRANSLATE_MODEL,
@@ -66,7 +68,8 @@ async def transcribe_audio(
 
     try:
         transcribe_result, translate_result = await asyncio.gather(
-            transcribe_coro, translate_coro
+            client.audio.transcriptions.create(**transcribe_kwargs),
+            translate_coro,
         )
     except Exception as exc:
         raise SpeechToTextError(f"Groq STT failed: {exc}") from exc
@@ -75,12 +78,28 @@ async def transcribe_audio(
     detected_language = (
         getattr(transcribe_result, "language", None) or "unknown"
     ).lower()
-    language = language_hint if language_hint in {"en", "ur"} else normalize_supported_language(detected_language)
+
+    if language_hint in {"en", "ur"}:
+        language = language_hint
+    else:
+        language = infer_language_from_text(text, detected_language)
+
+    if language == "ur" and language_hint != "en":
+        has_devanagari = any("\u0900" <= char <= "\u097f" for char in text)
+        has_arabic = any("\u0600" <= char <= "\u06ff" for char in text)
+        is_ascii_english = _language_from_script(text) == "en"
+        if has_devanagari or (not has_arabic and not is_ascii_english):
+            text = await _transcribe_with_urdu_script(
+                client,
+                audio_bytes=audio_bytes,
+                filename=filename,
+                content_type=content_type,
+                fallback_text=text,
+            )
 
     if not text:
         raise SpeechToTextError("Groq STT returned an empty transcript.")
 
-    # If already English, the translation is the same text — skip redundant storage.
     english_text: str | None = (
         getattr(translate_result, "text", None) or ""
     ).strip() or None
@@ -99,6 +118,52 @@ def normalize_supported_language(language: str) -> str:
     normalized = language.lower().strip().split("-")[0].split("_")[0]
     if normalized in {"en", "eng", "english"}:
         return "en"
-    if normalized in {"ur", "urd", "urdu"}:
-        return "ur"
     return "ur"
+
+
+def infer_language_from_text(text: str, detected_language: str) -> str:
+    """Map Whisper tags and transcript script to supported en/ur labels."""
+    script_lang = _language_from_script(text)
+    whisper_lang = normalize_supported_language(detected_language)
+    if script_lang == "en":
+        return "en"
+    if script_lang == "ur":
+        return "ur"
+    return whisper_lang
+
+
+def _language_from_script(text: str) -> str | None:
+    if any("\u0600" <= char <= "\u06ff" for char in text):
+        return "ur"
+    if any("\u0900" <= char <= "\u097f" for char in text):
+        return "ur"
+    letters = [char for char in text if char.isalpha()]
+    if letters and all(ord(char) < 128 for char in letters):
+        return "en"
+    if re.search(r"[\u0600-\u06ff\u0900-\u097f]", text):
+        return "ur"
+    return None
+
+
+async def _transcribe_with_urdu_script(
+    client: AsyncGroq,
+    *,
+    audio_bytes: bytes,
+    filename: str,
+    content_type: str,
+    fallback_text: str,
+) -> str:
+    """Re-transcribe with an Urdu hint so Hindi/other detections use Urdu script."""
+    if _language_from_script(fallback_text) == "ur":
+        return fallback_text
+    try:
+        result = await client.audio.transcriptions.create(
+            file=(filename, audio_bytes, content_type),
+            model=_TRANSCRIBE_MODEL,
+            response_format="verbose_json",
+            language="ur",
+        )
+        text = (getattr(result, "text", None) or "").strip()
+        return text or fallback_text
+    except Exception:
+        return fallback_text
