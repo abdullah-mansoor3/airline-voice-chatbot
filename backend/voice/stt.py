@@ -85,10 +85,12 @@ async def transcribe_audio(
         language = infer_language_from_text(text, detected_language)
 
     if language == "ur" and language_hint != "en":
-        has_devanagari = any("\u0900" <= char <= "\u097f" for char in text)
-        has_arabic = any("\u0600" <= char <= "\u06ff" for char in text)
+        has_devanagari = _has_devanagari(text)
+        has_urdu_script = _has_urdu_script(text)
         is_ascii_english = _language_from_script(text) == "en"
-        if has_devanagari or (not has_arabic and not is_ascii_english):
+        if has_devanagari:
+            text = await _convert_to_urdu_script(client, text) or text
+        elif not has_urdu_script and not is_ascii_english:
             text = await _transcribe_with_urdu_script(
                 client,
                 audio_bytes=audio_bytes,
@@ -103,6 +105,10 @@ async def transcribe_audio(
     english_text: str | None = (
         getattr(translate_result, "text", None) or ""
     ).strip() or None
+    if english_text and _is_useless_translation(english_text):
+        english_text = None
+    if language == "ur" and not english_text and text:
+        english_text = await _translate_urdu_to_english(client, text)
     if language == "en":
         english_text = None
 
@@ -133,9 +139,9 @@ def infer_language_from_text(text: str, detected_language: str) -> str:
 
 
 def _language_from_script(text: str) -> str | None:
-    if any("\u0600" <= char <= "\u06ff" for char in text):
+    if _has_urdu_script(text):
         return "ur"
-    if any("\u0900" <= char <= "\u097f" for char in text):
+    if _has_devanagari(text):
         return "ur"
     letters = [char for char in text if char.isalpha()]
     if letters and all(ord(char) < 128 for char in letters):
@@ -143,6 +149,22 @@ def _language_from_script(text: str) -> str | None:
     if re.search(r"[\u0600-\u06ff\u0900-\u097f]", text):
         return "ur"
     return None
+
+
+def _has_urdu_script(text: str) -> bool:
+    return any("\u0600" <= char <= "\u06ff" for char in text)
+
+
+def _has_devanagari(text: str) -> bool:
+    return any("\u0900" <= char <= "\u097f" for char in text)
+
+
+def _is_useless_translation(text: str) -> bool:
+    compact = text.strip()
+    if len(compact) <= 2 and not any(char.isalnum() for char in compact):
+        return True
+    words = re.findall(r"[A-Za-z\u0600-\u06ff]+", compact)
+    return len(words) == 0
 
 
 async def _transcribe_with_urdu_script(
@@ -154,7 +176,7 @@ async def _transcribe_with_urdu_script(
     fallback_text: str,
 ) -> str:
     """Re-transcribe with an Urdu hint so Hindi/other detections use Urdu script."""
-    if _language_from_script(fallback_text) == "ur":
+    if _has_urdu_script(fallback_text) and not _has_devanagari(fallback_text):
         return fallback_text
     try:
         result = await client.audio.transcriptions.create(
@@ -167,3 +189,50 @@ async def _transcribe_with_urdu_script(
         return text or fallback_text
     except Exception:
         return fallback_text
+
+
+async def _convert_to_urdu_script(client: AsyncGroq, text: str) -> str | None:
+    try:
+        completion = await client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Convert the text into natural Pakistani Urdu written only in Urdu script. "
+                        "Do not translate to Hindi, Arabic, or English. Output only the corrected Urdu transcript."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+            temperature=0.0,
+            max_tokens=180,
+        )
+        converted = (completion.choices[0].message.content or "").strip()
+        if converted and _has_urdu_script(converted) and not _has_devanagari(converted):
+            return converted
+    except Exception:
+        return None
+    return None
+
+
+async def _translate_urdu_to_english(client: AsyncGroq, text: str) -> str | None:
+    try:
+        completion = await client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Translate this Urdu or code-switched passenger claim to English. Output only the translation.",
+                },
+                {"role": "user", "content": text},
+            ],
+            temperature=0.0,
+            max_tokens=220,
+        )
+        translated = (completion.choices[0].message.content or "").strip()
+        if translated and not _is_useless_translation(translated):
+            return translated
+    except Exception:
+        return None
+    return None

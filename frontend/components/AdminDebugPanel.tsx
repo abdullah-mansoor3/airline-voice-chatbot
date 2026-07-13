@@ -25,6 +25,9 @@ function asList(value: unknown): string[] {
 function ChainStep({ entry, index }: { entry: Record<string, unknown>; index: number }) {
   const node = asString(entry.node);
   const step = asString(entry.step);
+  const status = asString(entry.status);
+  const error = asString(entry.error);
+  const model = asString(entry.model);
 
   return (
     <article className="debugStep">
@@ -33,8 +36,33 @@ function ChainStep({ entry, index }: { entry: Record<string, unknown>; index: nu
         <div>
           <h4 className="debugStepTitle">{node}</h4>
           {step !== "—" && <p className="debugStepSubtitle">{step}</p>}
+          {model !== "—" && <p className="debugStepSubtitle">Model: {model}</p>}
+        </div>
+        <div className={`debugStatus ${status === "success" ? "success" : status === "fallback" ? "fallback" : "error"}`}>
+          {status}
         </div>
       </header>
+
+      {error && error !== "—" && (
+        <section className="debugBlock error">
+          <h5>Error</h5>
+          <p className="debugError">{error}</p>
+        </section>
+      )}
+
+      {entry.input ? (
+        <section className="debugBlock">
+          <h5>Input</h5>
+          <pre className="debugJson">{JSON.stringify(entry.input, null, 2)}</pre>
+        </section>
+      ) : null}
+
+      {entry.output ? (
+        <section className="debugBlock">
+          <h5>Output</h5>
+          <pre className="debugJson">{JSON.stringify(entry.output, null, 2)}</pre>
+        </section>
+      ) : null}
 
       {entry.reasoning || entry.internal_reasoning ? (
         <section className="debugBlock">
@@ -91,6 +119,25 @@ function ChainStep({ entry, index }: { entry: Record<string, unknown>; index: nu
               </span>
             ))}
           </p>
+        </section>
+      ) : null}
+
+      {entry.errors ? (
+        <section className="debugBlock error">
+          <h5>Tool Errors</h5>
+          <ul className="debugList">
+            {(entry.errors as Record<string, unknown>[]).map((err, i) => (
+              <li key={i}>
+                <strong>{asString(err.tool)}</strong>
+                <p className="debugError">{asString(err.error)}</p>
+                {err.args ? (
+                  <code className="debugInlineCode">
+                    {JSON.stringify(err.args)}
+                  </code>
+                ) : null}
+              </li>
+            ))}
+          </ul>
         </section>
       ) : null}
 
@@ -170,14 +217,14 @@ function ToolResultsSummary({ results }: { results: Record<string, unknown> }) {
 function MemoryView({ memory }: { memory: Record<string, unknown> }) {
   const recent = (memory.recent_messages as Record<string, unknown>[]) || [];
   const facts = (memory.long_term_facts as Record<string, unknown>[]) || [];
-  const summary = asString(memory.summary);
+  const shortTerm = asString(memory.short_term_summary || memory.summary);
 
   return (
     <div className="debugMemoryView">
-      {summary !== "—" ? (
+      {shortTerm !== "—" ? (
         <section className="debugBlock">
-          <h5>Summary</h5>
-          <p>{summary}</p>
+          <h5>Short term summary</h5>
+          <p>{shortTerm}</p>
         </section>
       ) : null}
       {recent.length > 0 ? (

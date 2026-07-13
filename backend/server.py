@@ -630,10 +630,43 @@ async def _handle_turn(
         conversation = session.conversation
 
         memory = await load_memory_context(conversation)
+        send_lock = asyncio.Lock()
+        tts_tasks: list[asyncio.Task[None]] = []
+        tts_stage_sent = False
 
         async def token_callback(delta: str):
             if delta and not cancel_event.is_set():
-                await websocket.send_json({"type": "agent_token", "text": delta})
+                async with send_lock:
+                    await websocket.send_json({"type": "agent_token", "text": delta})
+
+        async def sentence_callback(sentence: str):
+            nonlocal tts_stage_sent
+            if cancel_event.is_set() or not sentence.strip():
+                return
+            if not tts_stage_sent:
+                tts_stage_sent = True
+                async with send_lock:
+                    await websocket.send_json({"type": "processing", "stage": "tts"})
+
+            async def synthesize_and_send() -> None:
+                try:
+                    audio = await synthesize_speech(sentence, stt_result.language)
+                except TextToSpeechError:
+                    return
+                if cancel_event.is_set():
+                    return
+                async with send_lock:
+                    await websocket.send_json(
+                        {
+                            "type": "tts_audio",
+                            "mimeType": "audio/mpeg",
+                            "bytes": len(audio),
+                            "purpose": "response",
+                        }
+                    )
+                    await websocket.send_bytes(audio)
+
+            tts_tasks.append(asyncio.create_task(synthesize_and_send()))
 
         async def debug_callback(trace_entry: dict):
             if is_admin and not cancel_event.is_set():
@@ -645,6 +678,7 @@ async def _handle_turn(
             user_id=conversation.user_id,
             memory_context=memory.for_prompt(),
             token_callback=token_callback,
+            sentence_callback=sentence_callback,
             debug_callback=debug_callback if is_admin else None,
         )
 
@@ -660,14 +694,15 @@ async def _handle_turn(
         response_text = agent_result.response_text
         response_language = agent_result.language
 
-        await websocket.send_json(
-            {
-                "type": "agent_response",
-                "text": response_text,
-                "language": response_language,
-                "citations": _citation_payload(agent_result.retrieved_chunks),
-            }
-        )
+        async with send_lock:
+            await websocket.send_json(
+                {
+                    "type": "agent_response",
+                    "text": response_text,
+                    "language": response_language,
+                    "citations": _citation_payload(agent_result.retrieved_chunks),
+                }
+            )
 
         try:
             await record_turn(
@@ -689,26 +724,35 @@ async def _handle_turn(
             agent_text=response_text,
         )
 
-        await websocket.send_json({"type": "processing", "stage": "tts"})
+        if tts_tasks:
+            await asyncio.gather(*tts_tasks, return_exceptions=True)
 
-        try:
-            async for sentence_audio in stream_speech_sentences(
-                response_text,
-                response_language,
-                cancel_event=cancel_event,
-            ):
-                if cancel_event.is_set():
-                    break
-                await websocket.send_json(
-                    {
-                        "type": "tts_audio",
-                        "mimeType": "audio/mpeg",
-                        "bytes": len(sentence_audio),
-                    }
-                )
-                await websocket.send_bytes(sentence_audio)
-        except TextToSpeechError as exc:
-            await websocket.send_json({"type": "error", "message": str(exc)})
+        if not tts_tasks:
+            await websocket.send_json({"type": "processing", "stage": "tts"})
+            try:
+                async for sentence_audio in stream_speech_sentences(
+                    response_text,
+                    response_language,
+                    cancel_event=cancel_event,
+                ):
+                    if cancel_event.is_set():
+                        break
+                    await websocket.send_json(
+                        {
+                            "type": "tts_audio",
+                            "mimeType": "audio/mpeg",
+                            "bytes": len(sentence_audio),
+                            "purpose": "response",
+                        }
+                    )
+                    await websocket.send_bytes(sentence_audio)
+            except TextToSpeechError as exc:
+                # Send a simple error message without calling LLM
+                await websocket.send_json({
+                    "type": "tts_error",
+                    "message_en": "No voice was detected please try again",
+                    "message_ur": "آواز نہیں ملی، براہ کرم دوبارہ کوشش کریں"
+                })
     except asyncio.CancelledError:
         raise
     except Exception as exc:

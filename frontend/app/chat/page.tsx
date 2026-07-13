@@ -25,6 +25,7 @@ type ServerEvent =
   | { type: "agent_response"; text: string; language: string; citations?: Citation[] }
   | { type: "agent_token"; text: string }
   | { type: "tts_audio"; mimeType: string; bytes: number; purpose?: "notice" | "response" }
+  | { type: "tts_error"; message_en: string; message_ur: string }
   | { type: "turn_complete" }
   | { type: "voice_mode_end" }
   | { type: "cancelled" }
@@ -36,6 +37,7 @@ type ServerEvent =
 
 type ConversationSummary = {
   id: string;
+  user_id?: string | null;
   title: string | null;
   status: string | null;
   primary_language: string | null;
@@ -78,9 +80,12 @@ const apiUrl = wsUrl.replace(/^ws/, "http").replace(/\/ws\/voice$/, "");
 
 // VAD settings (must match backend VadSettings defaults)
 const VAD_SILENCE_MS = 950;
-const VAD_ENERGY_THRESHOLD = 0.07;
-const VAD_BARGE_IN_THRESHOLD = 0.075;
+const VAD_BARGE_IN_THRESHOLD = 0.23;
 const VAD_MIN_SPEECH_MS = 450;
+const RMS_BUFFER_SIZE = 5;
+const MIN_SILENT_FRAMES = 3;
+const MIN_VAD_THRESHOLD = 0.015;
+const MAX_VAD_THRESHOLD = 0.18;
 
 // ── Main Component ───────────────────────────────────────────────────────────
 
@@ -101,6 +106,8 @@ export default function ChatPage() {
   const [textDraft, setTextDraft] = useState("");
   const [languageMode, setLanguageMode] = useState<LanguageMode>("auto");
   const [conversationMode, setConversationMode] = useState(false);
+  const [vadSensitivity, setVadSensitivity] = useState(0.95);
+  const [isCalibrating, setIsCalibrating] = useState(false);
   const [error, setError] = useState("");
   const [vadVolume, setVadVolume] = useState(0);
   const [isPlayingTts, setIsPlayingTts] = useState(false);
@@ -139,8 +146,18 @@ export default function ChatPage() {
   const conversationIdRef = useRef<string | null>(null);
   const isAdminRef = useRef(false);
   const userIdRef = useRef<string | null>(null);
+  const rmsBufferRef = useRef<number[]>([]);
+  const consecutiveSilentFramesRef = useRef(0);
+  const noiseFloorRef = useRef(0);
+  const vadSensitivityRef = useRef(0.95);
 
   function resetSessionState() {
+    wsRef.current?.close();
+    wsRef.current = null;
+    stopVad();
+    releaseHandsFreeStream();
+    stopStream();
+    clearPlayback();
     conversationIdRef.current = null;
     setConversationId(null);
     setConversations([]);
@@ -194,11 +211,16 @@ export default function ChatPage() {
   }, [recordingState]);
 
   useEffect(() => {
+    vadSensitivityRef.current = vadSensitivity;
+  }, [vadSensitivity]);
+
+  useEffect(() => {
     connectionRef.current = connection;
   }, [connection]);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
+      resetSessionState();
       setSession(data.session);
       userIdRef.current = data.session?.user?.id ?? null;
       if (!data.session) router.replace("/login");
@@ -207,7 +229,7 @@ export default function ChatPage() {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, nextSession) => {
       const nextUserId = nextSession?.user?.id ?? null;
-      if (userIdRef.current && nextUserId && userIdRef.current !== nextUserId) {
+      if (userIdRef.current !== nextUserId) {
         resetSessionState();
       }
       if (!nextSession) {
@@ -290,6 +312,7 @@ export default function ChatPage() {
       setMessages([]);
       return;
     }
+    if (isProcessingRef.current) return;
     loadMessages(conversationId);
   }, [session, conversationId]);
 
@@ -297,6 +320,11 @@ export default function ChatPage() {
 
   function drainAudioQueue() {
     if (isPlayingRef.current || audioQueueRef.current.length === 0) return;
+    if (conversationModeRef.current && !analyserRef.current) {
+      void ensureHandsFreeStream().then((stream) => {
+        if (stream && !analyserRef.current) startVad(stream);
+      });
+    }
     const blob = audioQueueRef.current.shift()!;
     isPlayingRef.current = true;
     setIsPlayingTts(true);
@@ -344,6 +372,25 @@ export default function ChatPage() {
     audioQueueRef.current = [];
     isPlayingRef.current = false;
     setIsPlayingTts(false);
+  }
+
+  function playTtsErrorMessages(messageEn: string, messageUr: string) {
+    // Use browser's speech synthesis for error messages
+    if ('speechSynthesis' in window) {
+      const utteranceEn = new SpeechSynthesisUtterance(messageEn);
+      utteranceEn.lang = 'en-US';
+      utteranceEn.rate = 0.9;
+
+      const utteranceUr = new SpeechSynthesisUtterance(messageUr);
+      utteranceUr.lang = 'ur-PK';
+      utteranceUr.rate = 0.9;
+
+      // Play English first, then Urdu
+      window.speechSynthesis.speak(utteranceEn);
+      utteranceEn.onend = () => {
+        window.speechSynthesis.speak(utteranceUr);
+      };
+    }
   }
 
   // ── Server Event Handler ───────────────────────────────────────────────────
@@ -484,6 +531,11 @@ export default function ChatPage() {
         nextExpectedBytesRef.current = event.bytes;
         break;
 
+      case "tts_error":
+        // Play error messages without adding to conversation
+        playTtsErrorMessages(event.message_en, event.message_ur);
+        break;
+
       case "turn_complete":
         isProcessingRef.current = false;
         setStatus("Ready");
@@ -571,6 +623,33 @@ export default function ChatPage() {
     handsFreeStreamRef.current = null;
   }
 
+  async function calibrateNoiseFloor(stream: MediaStream) {
+    setIsCalibrating(true);
+    const ctx = new AudioContext();
+    const source = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 256;
+    source.connect(analyser);
+
+    const bufLen = analyser.frequencyBinCount;
+    const dataArr = new Uint8Array(bufLen);
+    const samples: number[] = [];
+
+    for (let i = 0; i < 100; i++) {
+      analyser.getByteFrequencyData(dataArr);
+      const rms = Math.sqrt(dataArr.reduce((sum, v) => sum + v * v, 0) / bufLen) / 255;
+      samples.push(rms);
+      await new Promise(r => setTimeout(r, 20));
+    }
+
+    const avgNoise = samples.reduce((a, b) => a + b, 0) / samples.length;
+    noiseFloorRef.current = avgNoise;
+    setIsCalibrating(false);
+
+    source.disconnect();
+    await ctx.close();
+  }
+
   async function ensureHandsFreeStream(): Promise<MediaStream | null> {
     if (!conversationModeRef.current) return null;
     if (handsFreeStreamRef.current?.active) {
@@ -587,6 +666,7 @@ export default function ChatPage() {
       });
       handsFreeStreamRef.current = stream;
       streamRef.current = stream;
+      await calibrateNoiseFloor(stream);
       return stream;
     } catch {
       setError("Microphone access was denied.");
@@ -621,14 +701,33 @@ export default function ChatPage() {
 
     function tick() {
       analyser.getByteFrequencyData(dataArr);
-      const rms =
+      const currentRms =
         Math.sqrt(
           dataArr.reduce((sum, v) => sum + v * v, 0) / bufLen,
         ) / 255;
 
-      setVadVolume(Math.min(1, rms * 4));
+      // Add to buffer and calculate moving average
+      rmsBufferRef.current.push(currentRms);
+      if (rmsBufferRef.current.length > RMS_BUFFER_SIZE) {
+        rmsBufferRef.current.shift();
+      }
+      const rms = rmsBufferRef.current.reduce((a, b) => a + b, 0) / rmsBufferRef.current.length;
 
-      const isSpeech = rms >= VAD_ENERGY_THRESHOLD;
+      const effectiveThreshold =
+        noiseFloorRef.current +
+        Math.max(
+          MIN_VAD_THRESHOLD,
+          MAX_VAD_THRESHOLD * (1 - vadSensitivityRef.current),
+        );
+      // Display volume relative to effective threshold for better visualization
+      const volumeDisplay = rms / (effectiveThreshold || 0.1);
+      setVadVolume(Math.min(1, volumeDisplay));
+      const isSpeech = rms >= effectiveThreshold;
+
+      // Debug logging for admin
+      if (isAdminRef.current) {
+        console.log(`VAD: rms=${rms.toFixed(3)}, noiseFloor=${noiseFloorRef.current.toFixed(3)}, effectiveThreshold=${effectiveThreshold.toFixed(3)}, isSpeech=${isSpeech}, silentFrames=${consecutiveSilentFramesRef.current}`);
+      }
 
       if (
         isProcessingRef.current &&
@@ -641,32 +740,32 @@ export default function ChatPage() {
 
       if (isSpeech) {
         silenceStartRef.current = null;
+        consecutiveSilentFramesRef.current = 0;
         if (speechStartRef.current === null) {
           speechStartRef.current = Date.now();
         }
         hasSpeech = true;
       } else if (hasSpeech) {
-        if (silenceStartRef.current === null) {
-          silenceStartRef.current = Date.now();
-        } else if (Date.now() - silenceStartRef.current >= VAD_SILENCE_MS) {
-          const speechDuration =
-            speechStartRef.current !== null
-              ? Date.now() - speechStartRef.current
-              : 0;
-          if (speechDuration >= VAD_MIN_SPEECH_MS) {
-            stopRecording();
-            return;
+        consecutiveSilentFramesRef.current++;
+        if (consecutiveSilentFramesRef.current >= MIN_SILENT_FRAMES) {
+          if (silenceStartRef.current === null) {
+            silenceStartRef.current = Date.now();
+          } else if (Date.now() - silenceStartRef.current >= VAD_SILENCE_MS) {
+            const speechDuration =
+              speechStartRef.current !== null
+                ? Date.now() - speechStartRef.current
+                : 0;
+            if (speechDuration >= VAD_MIN_SPEECH_MS) {
+              stopRecording();
+              return;
+            }
           }
         }
       }
 
       // Barge-in detection: if TTS is playing and energy is high, cancel
       if (isPlayingRef.current && rms >= VAD_BARGE_IN_THRESHOLD) {
-        sendCancel();
-        if (!conversationModeRef.current) {
-          stopStream();
-        }
-        vadRafRef.current = requestAnimationFrame(tick);
+        interruptAssistantAndListen();
         return;
       }
 
@@ -751,10 +850,8 @@ export default function ChatPage() {
       }
       recorderRef.current = null;
       isProcessingRef.current = true;
-      if (!conversationModeRef.current) {
-        stopStream();
-        stopVad();
-      }
+      stopVad();
+      if (!conversationModeRef.current) stopStream();
     };
 
     socket.send(
@@ -776,14 +873,20 @@ export default function ChatPage() {
   function stopRecording() {
     const recorder = recorderRef.current;
     if (recorder && recorder.state !== "inactive") {
+      try {
+        recorder.requestData();
+      } catch {
+        // Some browsers throw if a final chunk is already queued.
+      }
       recorder.stop();
     }
+    stopVad();
+    speechStartRef.current = null;
+    silenceStartRef.current = null;
+    consecutiveSilentFramesRef.current = 0;
+    rmsBufferRef.current = [];
     setRecordingState("processing");
     isProcessingRef.current = true;
-    if (conversationModeRef.current) {
-      setConversationMode(false);
-      pendingAutoListenRef.current = false;
-    }
   }
 
   function stopStream() {
@@ -795,11 +898,16 @@ export default function ChatPage() {
   }
 
   function sendCancel() {
+    stopAgentGeneration();
+  }
+
+  function stopAgentGeneration() {
     const socket = wsRef.current;
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: "cancel" }));
     }
     clearPlayback();
+    stopVad();
     if (conversationModeRef.current) {
       pendingAutoListenRef.current = true;
     } else {
@@ -808,6 +916,45 @@ export default function ChatPage() {
     setRecordingState("idle");
     isProcessingRef.current = false;
     setStatus("Ready");
+  }
+
+  function muteAssistantVoice() {
+    const socket = wsRef.current;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "cancel" }));
+    }
+    clearPlayback();
+    setRecordingState("idle");
+    isProcessingRef.current = false;
+    setStatus("Ready");
+    if (conversationModeRef.current) {
+      pendingAutoListenRef.current = true;
+      maybeAutoListen();
+    }
+  }
+
+  function interruptAssistantAndListen() {
+    const socket = wsRef.current;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "cancel" }));
+    }
+    clearPlayback();
+    stopVad();
+    pendingAutoListenRef.current = false;
+    setRecordingState("idle");
+    isProcessingRef.current = false;
+    setStatus("Listening…");
+    if (conversationModeRef.current && recordingStateRef.current === "idle") {
+      window.setTimeout(() => {
+        if (
+          conversationModeRef.current &&
+          recordingStateRef.current === "idle" &&
+          wsRef.current?.readyState === WebSocket.OPEN
+        ) {
+          startRecording();
+        }
+      }, 100);
+    }
   }
 
   function sendTextMessage() {
@@ -826,7 +973,7 @@ export default function ChatPage() {
     setDebugTrace([]);
     setDebugBundle(null);
     lastTurnWasVoiceRef.current = false;
-    
+
     socket.send(JSON.stringify({ type: "text_message", text, languageMode }));
   }
 
@@ -864,9 +1011,11 @@ export default function ChatPage() {
   // ── Conversation History ──────────────────────────────────────────────────
 
   async function loadConversations() {
+    if (!sessionRef.current?.user?.id) return;
     const { data, error: loadError } = await supabase
       .from("conversations")
-      .select("id,title,status,primary_language,last_message_at")
+      .select("id,user_id,title,status,primary_language,last_message_at")
+      .eq("user_id", sessionRef.current.user.id)
       .order("last_message_at", { ascending: false })
       .limit(20);
 
@@ -880,10 +1029,10 @@ export default function ChatPage() {
   async function deleteConversation(id: string) {
     setError("");
     if (!session) return;
-    
+
     const convoToRestore = conversations.find((c) => c.id === id);
     setConversations((prev) => prev.filter((c) => c.id !== id));
-    
+
     if (conversationId === id) {
       setConversationId(null);
       setConnectionKey((k) => k + 1);
@@ -898,7 +1047,7 @@ export default function ChatPage() {
         Authorization: `Bearer ${session.access_token}`,
       },
     });
-    
+
     if (!response.ok) {
       const message = await response.text();
       if (response.status === 404) {
@@ -919,6 +1068,19 @@ export default function ChatPage() {
   }
 
   async function loadMessages(id: string) {
+    if (!sessionRef.current?.user?.id) return;
+    const ownerCheck = await supabase
+      .from("conversations")
+      .select("id,user_id")
+      .eq("id", id)
+      .eq("user_id", sessionRef.current.user.id)
+      .maybeSingle();
+    if (ownerCheck.error || !ownerCheck.data) {
+      setMessages([]);
+      setConversationId(null);
+      setConnectionKey((key) => key + 1);
+      return;
+    }
     const { data, error: loadError } = await supabase
       .from("messages")
       .select("id,speaker,original_text,english_text,created_at")
@@ -1109,6 +1271,48 @@ export default function ChatPage() {
           />
         ) : null}
 
+        {session && sidebarExpanded ? (
+          <details className="advancedPanel">
+            <summary>
+              <span className="controlIcon slidersIcon" aria-hidden="true" />
+              Advanced
+            </summary>
+            <div className="advancedBody">
+              <label className="modeField stacked">
+                Language
+                <select
+                  value={languageMode}
+                  onChange={(event) => setLanguageMode(event.target.value as LanguageMode)}
+                >
+                  <option value="auto">Auto</option>
+                  <option value="ur">Force Urdu</option>
+                  <option value="en">Force English</option>
+                </select>
+              </label>
+              <label className="modeField stacked">
+                VAD sensitivity: {vadSensitivity.toFixed(2)}
+                <input
+                  type="range"
+                  min="0.05"
+                  max="0.95"
+                  step="0.01"
+                  value={vadSensitivity}
+                  onChange={(event) => setVadSensitivity(parseFloat(event.target.value))}
+                  className="sensitivitySlider"
+                />
+              </label>
+              <button
+                onClick={() => handsFreeStreamRef.current && calibrateNoiseFloor(handsFreeStreamRef.current)}
+                disabled={isCalibrating || !handsFreeStreamRef.current?.active}
+                type="button"
+                className="calibrateBtn"
+              >
+                {isCalibrating ? "Calibrating..." : "Recalibrate noise"}
+              </button>
+            </div>
+          </details>
+        ) : null}
+
       </aside>
 
       <main className="main">
@@ -1215,29 +1419,20 @@ export default function ChatPage() {
             <div className="vadFill" style={{ width: barWidth }} />
           </div>
 
-          <div className="modeRow">
-            <label className="modeField">
-              Language
-              <select
-                value={languageMode}
-                onChange={(event) => setLanguageMode(event.target.value as LanguageMode)}
-              >
-                <option value="auto">Auto</option>
-                <option value="ur">Force Urdu</option>
-                <option value="en">Force English</option>
-              </select>
-            </label>
+          <div className="modeRow compactModeRow">
             <button
               className={`voiceToggle ${conversationMode ? "active" : ""}`}
               onClick={() => setConversationMode((value) => !value)}
               type="button"
               aria-pressed={conversationMode}
             >
+              <span className="controlIcon voiceIcon" aria-hidden="true" />
               <span className="voiceToggleTrack">
                 <span className="voiceToggleThumb" />
               </span>
               Hands-free
             </button>
+            <span className="advancedHint">Audio settings are in Advanced.</span>
           </div>
 
           <div className="composerRow">
@@ -1270,21 +1465,33 @@ export default function ChatPage() {
 
             {isRecording ? (
               <button
-                className="micBtn stopMicBtn"
+                className="micBtn sendVoiceBtn"
                 onClick={stopRecording}
                 type="button"
                 aria-label="Stop recording and send"
               >
-                Stop
+                <span className="controlIcon sendVoiceIcon" aria-hidden="true" />
+                Send voice
               </button>
-            ) : isProcessing || isPlayingTts ? (
+            ) : isProcessing ? (
               <button
                 className="stopGenerationBtn iconStopBtn"
-                onClick={sendCancel}
+                onClick={stopAgentGeneration}
                 type="button"
-                aria-label="Stop agent"
+                aria-label="Stop generating response"
               >
-                Stop
+                <span className="controlIcon stopIcon" aria-hidden="true" />
+                Stop generating
+              </button>
+            ) : isPlayingTts ? (
+              <button
+                className="muteVoiceBtn iconStopBtn"
+                onClick={muteAssistantVoice}
+                type="button"
+                aria-label="Mute assistant voice"
+              >
+                <span className="controlIcon muteIcon" aria-hidden="true" />
+                Mute voice
               </button>
             ) : (
               <button
@@ -1295,6 +1502,7 @@ export default function ChatPage() {
                 type="button"
                 aria-label="Start recording"
               >
+                <span className="controlIcon micIcon" aria-hidden="true" />
                 Mic
               </button>
             )}

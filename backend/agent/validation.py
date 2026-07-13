@@ -232,7 +232,7 @@ def _fallback_answer(language: str) -> str:
             "Please share the airline, route, date, and what happened so I can check the policy."
         )
     return (
-        "میں اس دعوے کے لیے قابلِ اعتماد جواب validate نہیں کر سکا۔ "
+        "میں اس دعوے کے لیے قابلِ اعتماد جواب کی تصدیق نہیں کر سکا۔ "
         "براہ کرم ائیرلائن، روٹ، تاریخ، اور مسئلے کی تفصیل بتائیں تاکہ پالیسی چیک کی جا سکے۔"
     )
 
