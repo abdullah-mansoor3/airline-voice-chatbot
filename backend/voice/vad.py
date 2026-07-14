@@ -2,15 +2,19 @@ from __future__ import annotations
 
 """Voice Activity Detection helpers.
 
-The server-side VAD is intentionally minimal: the primary end-of-turn signal
-comes from the client (a ``"stop"`` event after the browser-side VAD fires).
-This module owns the tunable thresholds and provides a helper for evaluating
-a raw PCM energy level so that a future tighter integration (e.g. server-side
-WebRTC VAD) can slot in without touching the WebSocket handler.
+LEGACY: This module is no longer used in production. The frontend now uses
+Silero VAD (@ricky0123/vad-web) for end-of-turn detection and barge-in,
+replacing the RMS-threshold approach. The server-side VAD logic here is
+retained only for reference or potential future server-side VAD integration.
 
-Barge-in detection is also client-driven: the browser sends a ``"cancel"``
-event when it detects the user speaking during TTS playback. The server
-cancels in-flight TTS work when it receives that event (see ``server.py``).
+The primary end-of-turn signal now comes from the client (a ``"stop"`` event
+after the browser-side Silero VAD fires). Barge-in detection is also
+client-driven: the browser sends a ``"cancel"`` event when it detects the
+user speaking during TTS playback. The server cancels in-flight TTS work
+when it receives that event (see ``server.py``).
+
+Note: The energy_threshold and related constants here are no longer used by
+the frontend and do not need to match any client-side configuration.
 """
 
 from dataclasses import dataclass

@@ -1,5 +1,4 @@
 "use client";
-
 import type { Session } from "@supabase/supabase-js";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -80,7 +79,7 @@ const apiUrl = wsUrl.replace(/^ws/, "http").replace(/\/ws\/voice$/, "");
 
 // VAD settings (must match backend VadSettings defaults)
 const VAD_SILENCE_MS = 950;
-const VAD_BARGE_IN_THRESHOLD = 0.23;
+const VAD_BARGE_IN_THRESHOLD = 0.25;
 const VAD_MIN_SPEECH_MS = 450;
 const RMS_BUFFER_SIZE = 5;
 const MIN_SILENT_FRAMES = 3;
@@ -883,8 +882,6 @@ export default function ChatPage() {
     stopVad();
     speechStartRef.current = null;
     silenceStartRef.current = null;
-    consecutiveSilentFramesRef.current = 0;
-    rmsBufferRef.current = [];
     setRecordingState("processing");
     isProcessingRef.current = true;
   }
@@ -1289,26 +1286,6 @@ export default function ChatPage() {
                   <option value="en">Force English</option>
                 </select>
               </label>
-              <label className="modeField stacked">
-                VAD sensitivity: {vadSensitivity.toFixed(2)}
-                <input
-                  type="range"
-                  min="0.05"
-                  max="0.95"
-                  step="0.01"
-                  value={vadSensitivity}
-                  onChange={(event) => setVadSensitivity(parseFloat(event.target.value))}
-                  className="sensitivitySlider"
-                />
-              </label>
-              <button
-                onClick={() => handsFreeStreamRef.current && calibrateNoiseFloor(handsFreeStreamRef.current)}
-                disabled={isCalibrating || !handsFreeStreamRef.current?.active}
-                type="button"
-                className="calibrateBtn"
-              >
-                {isCalibrating ? "Calibrating..." : "Recalibrate noise"}
-              </button>
             </div>
           </details>
         ) : null}
