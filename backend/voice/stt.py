@@ -11,7 +11,14 @@ from groq import AsyncGroq
 _PRIMARY_MODEL = "openai/gpt-oss-120b"
 _FALLBACK_MODEL = "openai/gpt-oss-20b"
 _TRANSCRIBE_MODEL = "whisper-large-v3"
-_DOMAIN_PROMPT = "پی آئی اے، ایئربلو، سیرین، ریفنڈ، منسوخ، ڈیلے، سامان، بکنگ، منسوخی"
+_DOMAIN_PROMPT = """یہ گفتگو پاکستان کی ایک ایئرلائن کسٹمر سپورٹ ایپ کے بارے میں ہے۔
+پی آئی اے پاکستان انٹرنیشنل ایئرلائنز ایئربلو سیرین ایئر فلائی جناح ایئر سیال
+فلائٹ پرواز بکنگ ریزرویشن ٹکٹ ریفنڈ ری شیڈول ری بک کینسل منسوخ ڈیلے تاخیر
+بورڈنگ چیک ان گیٹ ٹرمینل سامان بیگیج کیری آن اضافی سامان کارگو
+اسلام آباد کراچی لاہور پشاور کوئٹہ ملتان سکردو گلگت
+دبئی جدہ ریاض مدینہ دوحہ مسقط ابوظہبی شارجہ استنبول
+PNR Booking ID Reference Number Confirmation Number Seat Business Class Economy Window Seat Aisle Seat
+انگریزی الفاظ اردو گفتگو میں شامل ہو سکتے ہیں۔"""
 
 class SpeechToTextError(RuntimeError):
     pass
@@ -56,8 +63,16 @@ async def transcribe_audio(
     if not api_key:
         raise SpeechToTextError("GROQ_API_KEY is missing; cannot transcribe audio.")
 
+    # Validate audio size - need at least some audio data
+    if len(audio_bytes) < 1000:
+        raise SpeechToTextError(f"Audio too short ({len(audio_bytes)} bytes). Please speak for longer.")
+
     client = AsyncGroq(api_key=api_key)
-    file_tuple = (filename, audio_bytes, content_type)
+
+    # Strip codec parameter from content_type for Groq compatibility
+    # e.g., "audio/webm;codecs=opus" -> "audio/webm"
+    clean_content_type = content_type.split(";")[0].strip()
+    file_tuple = (filename, audio_bytes, clean_content_type)
 
     if language_hint is None:
         try:
@@ -199,7 +214,67 @@ async def _translate_text_urdu_to_english(text: str, client: AsyncGroq) -> str |
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a professional translator. Translate the given Urdu text to English. Return only the English translation, nothing else.",
+                        "content": """
+                        You are translating speech from a Pakistani airline customer support conversation.
+
+                        The input comes from Whisper speech recognition and may contain:
+
+                        - recognition mistakes
+                        - Urdu mixed with English
+                        - Roman Urdu
+                        - airline names
+                        - airport names
+                        - flight numbers
+                        - booking IDs
+                        - PNRs
+                        - English aviation terminology spoken in Urdu
+
+                        Your task is to recover the intended meaning.
+
+                        Rules:
+
+                        • Preserve airline names exactly whenever possible.
+
+                        • Preserve airport codes exactly.
+
+                        • Preserve flight numbers exactly.
+
+                        • Preserve booking IDs exactly.
+
+                        • Preserve PNRs exactly.
+
+                        • Do NOT translate proper nouns.
+
+                        • Correct obvious Whisper mistakes using context.
+
+                        • If a word is clearly intended to be an airline or aviation term, recover the intended English spelling.
+
+                        Examples:
+
+                        پی آئی اے
+                        → PIA
+
+                        ایئربلو
+                        → Airblue
+
+                        سیرین
+                        → Serene Air
+
+                        فلائی جناح
+                        → Fly Jinnah
+
+                        اسلام آباد
+                        → Islamabad
+
+                        ریفنڈ
+                        → refund
+
+                        منسوخ
+                        → cancel
+
+                        Only return the translated English sentence.
+
+                        Do not explain anything.""",
                     },
                     {
                         "role": "user",

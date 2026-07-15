@@ -31,6 +31,7 @@ from .db.memory import load_memory_context, update_memory_after_turn
 from .db.supabase_client import get_service_supabase_client
 from .voice.stt import SpeechToTextError, transcribe_audio
 from .voice.tts import TextToSpeechError, stream_speech_sentences, synthesize_speech
+from .voice.router import route_voice_command, RouteResult
 from .voice.voice_intents import (
     is_exit_phrase,
     pick_filler,
@@ -615,6 +616,55 @@ async def _handle_turn(
                 stt_result.language,
                 cancel_event,
             )
+            return
+
+        # Voice Router - handle simple commands without invoking agent
+        route_result = route_voice_command(stt_result.text, stt_result.language)
+
+        if route_result.category != "agent":
+            # Handle routed command immediately
+            response_text = (
+                route_result.response_en
+                if stt_result.language == "en"
+                else route_result.response_ur
+            )
+
+            # Send the response
+            await websocket.send_json(
+                {
+                    "type": "agent_response",
+                    "text": response_text,
+                    "language": stt_result.language,
+                    "citations": [],
+                }
+            )
+
+            # TTS for the response
+            try:
+                audio = await synthesize_speech(response_text, stt_result.language)
+                await websocket.send_json({"type": "tts_audio", "language": stt_result.language})
+                await websocket.send_bytes(audio)
+            except TextToSpeechError:
+                pass  # TTS failure is not critical for simple commands
+
+            # Record the turn if we have a conversation
+            if session.conversation:
+                try:
+                    await record_turn(
+                        conversation=session.conversation,
+                        user_text=stt_result.text,
+                        user_language=stt_result.language,
+                        user_english_text=english_text,
+                        agent_text=response_text,
+                        agent_language=stt_result.language,
+                    )
+                except ConversationHistoryError:
+                    pass  # Recording failure is not critical
+
+            # Handle interrupt if needed
+            if route_result.should_interrupt:
+                await websocket.send_json({"type": "cancelled"})
+
             return
 
         await websocket.send_json({"type": "processing", "stage": "agent"})
