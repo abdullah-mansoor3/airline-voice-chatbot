@@ -12,6 +12,7 @@ export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [authMode, setAuthMode] = useState<"signin" | "signup">("signin");
+  const [rememberMe, setRememberMe] = useState(true);
   const [error, setError] = useState("");
   const [status, setStatus] = useState("");
 
@@ -32,6 +33,7 @@ export default function LoginPage() {
   async function submitAuth() {
     setError("");
     setStatus("");
+
     const action =
       authMode === "signin"
         ? supabase.auth.signInWithPassword({ email, password })
@@ -41,6 +43,20 @@ export default function LoginPage() {
       setError(authError.message);
       return;
     }
+
+    // Handle session persistence based on rememberMe toggle
+    if (!rememberMe) {
+      // Add beforeunload listener to clear session on tab close
+      const handleBeforeUnload = () => {
+        supabase.auth.signOut();
+      };
+      window.addEventListener('beforeunload', handleBeforeUnload);
+      // Store listener reference for cleanup if needed
+      (window as any)._authCleanup = () => {
+        window.removeEventListener('beforeunload', handleBeforeUnload);
+      };
+    }
+
     setStatus(
       authMode === "signin"
         ? "Signed in. Redirecting…"
@@ -100,6 +116,16 @@ export default function LoginPage() {
               type="password"
               value={password}
             />
+          </label>
+
+          <label className="authField" style={{ flexDirection: 'row', alignItems: 'center', gap: '0.5rem' }}>
+            <input
+              type="checkbox"
+              checked={rememberMe}
+              onChange={(event) => setRememberMe(event.target.checked)}
+              style={{ width: 'auto', margin: 0 }}
+            />
+            <span style={{ margin: 0 }}>Keep me signed in</span>
           </label>
 
           {error ? <p className="authError">{error}</p> : null}

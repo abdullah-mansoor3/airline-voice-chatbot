@@ -1,9 +1,11 @@
-
+docs/
 diagrams/
+
 
 # Node / Next.js
 node_modules/
 frontend/node_modules/
+frontend/public/
 frontend/.next/
 frontend/out/
 frontend/.env*.local

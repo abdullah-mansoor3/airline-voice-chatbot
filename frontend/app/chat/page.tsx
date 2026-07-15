@@ -120,7 +120,6 @@ export default function ChatPage() {
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
   const vadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const speechStartRef = useRef<number | null>(null);
   const silenceStartRef = useRef<number | null>(null);
@@ -149,6 +148,10 @@ export default function ChatPage() {
   const consecutiveSilentFramesRef = useRef(0);
   const noiseFloorRef = useRef(0);
   const vadSensitivityRef = useRef(0.95);
+  const vadWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
+  const vadSourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const vadWorkletLoadedRef = useRef(false);
+  const bargeInDebounceRef = useRef<number | null>(null);
 
   function resetSessionState() {
     wsRef.current?.close();
@@ -184,7 +187,7 @@ export default function ChatPage() {
     if (conversationMode && connectionRef.current === "connected" && sessionRef.current) {
       void (async () => {
         const stream = await ensureHandsFreeStream();
-        if (stream && !analyserRef.current) {
+        if (stream && !vadWorkletNodeRef.current) {
           startVad(stream);
         }
         if (recordingStateRef.current === "idle") {
@@ -319,9 +322,9 @@ export default function ChatPage() {
 
   function drainAudioQueue() {
     if (isPlayingRef.current || audioQueueRef.current.length === 0) return;
-    if (conversationModeRef.current && !analyserRef.current) {
+    if (conversationModeRef.current && !vadWorkletNodeRef.current) {
       void ensureHandsFreeStream().then((stream) => {
-        if (stream && !analyserRef.current) startVad(stream);
+        if (stream && !vadWorkletNodeRef.current) startVad(stream);
       });
     }
     const blob = audioQueueRef.current.shift()!;
@@ -683,106 +686,86 @@ export default function ChatPage() {
     );
   }
 
-  // ── VAD (browser-side energy detection) ───────────────────────────────────
+  // ── VAD (AudioWorklet-based) ─────────────────────────────────────────────
 
-  function startVad(stream: MediaStream) {
-    const ctx = new AudioContext();
-    const source = ctx.createMediaStreamSource(stream);
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 256;
-    source.connect(analyser);
-    audioCtxRef.current = ctx;
-    analyserRef.current = analyser;
-
-    const bufLen = analyser.frequencyBinCount;
-    const dataArr = new Uint8Array(bufLen);
-    let hasSpeech = false;
-
-    function tick() {
-      analyser.getByteFrequencyData(dataArr);
-      const currentRms =
-        Math.sqrt(
-          dataArr.reduce((sum, v) => sum + v * v, 0) / bufLen,
-        ) / 255;
-
-      // Add to buffer and calculate moving average
-      rmsBufferRef.current.push(currentRms);
-      if (rmsBufferRef.current.length > RMS_BUFFER_SIZE) {
-        rmsBufferRef.current.shift();
+  async function startVad(stream: MediaStream) {
+    try {
+      if (!audioCtxRef.current || audioCtxRef.current.state === "closed") {
+        audioCtxRef.current = new AudioContext();
+        vadWorkletLoadedRef.current = false;
       }
-      const rms = rmsBufferRef.current.reduce((a, b) => a + b, 0) / rmsBufferRef.current.length;
-
-      const effectiveThreshold =
-        noiseFloorRef.current +
-        Math.max(
-          MIN_VAD_THRESHOLD,
-          MAX_VAD_THRESHOLD * (1 - vadSensitivityRef.current),
-        );
-      // Display volume relative to effective threshold for better visualization
-      const volumeDisplay = rms / (effectiveThreshold || 0.1);
-      setVadVolume(Math.min(1, volumeDisplay));
-      const isSpeech = rms >= effectiveThreshold;
-
-      // Debug logging for admin
-      if (isAdminRef.current) {
-        console.log(`VAD: rms=${rms.toFixed(3)}, noiseFloor=${noiseFloorRef.current.toFixed(3)}, effectiveThreshold=${effectiveThreshold.toFixed(3)}, isSpeech=${isSpeech}, silentFrames=${consecutiveSilentFramesRef.current}`);
+      if (audioCtxRef.current.state === "suspended") {
+        await audioCtxRef.current.resume();
       }
 
-      if (
-        isProcessingRef.current &&
-        conversationModeRef.current &&
-        isSpeech &&
-        recordingStateRef.current !== "recording"
-      ) {
-        sendSpeechDuringProcessing();
+      if (!vadWorkletLoadedRef.current) {
+        await audioCtxRef.current.audioWorklet.addModule("/vad-processor.js");
+        vadWorkletLoadedRef.current = true;
       }
 
-      if (isSpeech) {
-        silenceStartRef.current = null;
-        consecutiveSilentFramesRef.current = 0;
-        if (speechStartRef.current === null) {
-          speechStartRef.current = Date.now();
-        }
-        hasSpeech = true;
-      } else if (hasSpeech) {
-        consecutiveSilentFramesRef.current++;
-        if (consecutiveSilentFramesRef.current >= MIN_SILENT_FRAMES) {
-          if (silenceStartRef.current === null) {
-            silenceStartRef.current = Date.now();
-          } else if (Date.now() - silenceStartRef.current >= VAD_SILENCE_MS) {
-            const speechDuration =
-              speechStartRef.current !== null
-                ? Date.now() - speechStartRef.current
-                : 0;
-            if (speechDuration >= VAD_MIN_SPEECH_MS) {
-              stopRecording();
-              return;
-            }
+      stopVadNodes();
+
+      const source = audioCtxRef.current.createMediaStreamSource(stream);
+      vadSourceNodeRef.current = source;
+
+      const workletNode = new AudioWorkletNode(audioCtxRef.current, "vad-processor");
+      vadWorkletNodeRef.current = workletNode;
+
+      workletNode.port.onmessage = (event: MessageEvent<{ type: string; rms: number }>) => {
+        const { type, rms } = event.data;
+        if (type === "volume") {
+          setVadVolume(Math.min(rms * 8, 1));
+        } else if (type === "speech_start") {
+          if (isPlayingRef.current) {
+            interruptAssistantAndListen();
+          } else if (recordingStateRef.current !== "recording") {
+            void startRecording();
           }
+        } else if (type === "speech_end") {
+          if (recordingStateRef.current === "recording") {
+            stopRecording();
+          }
+        } else if (type === "barge_in_candidate") {
+          // Debounce to prevent rapid repeated interrupts
+          if (bargeInDebounceRef.current) {
+            clearTimeout(bargeInDebounceRef.current);
+          }
+
+          bargeInDebounceRef.current = window.setTimeout(() => {
+            bargeInDebounceRef.current = null;
+
+            // Only interrupt if TTS is still playing
+            if (isPlayingRef.current) {
+              // Accept the barge-in candidate
+              workletNode.port.postMessage({ type: 'accept_barge_in' });
+              interruptAssistantAndListen();
+            } else {
+              // Reject the barge-in candidate (no longer relevant)
+              workletNode.port.postMessage({ type: 'reject_barge_in' });
+            }
+          }, 50); // 50ms debounce to ensure TTS state is stable
+        } else if (type === "debug") {
+          console.log('[VAD Debug]', event.data);
         }
-      }
+      };
 
-      // Barge-in detection: if TTS is playing and energy is high, cancel
-      if (isPlayingRef.current && rms >= VAD_BARGE_IN_THRESHOLD) {
-        interruptAssistantAndListen();
-        return;
-      }
-
-      vadRafRef.current = requestAnimationFrame(tick);
+      source.connect(workletNode);
+    } catch (error) {
+      console.error("Failed to initialize VAD:", error);
+      setError("Voice activity detection failed to initialize.");
     }
+  }
 
-    vadRafRef.current = requestAnimationFrame(tick);
+  function stopVadNodes() {
+    try { vadWorkletNodeRef.current?.disconnect(); } catch {}
+    try { vadWorkletNodeRef.current?.port.close(); } catch {}
+    vadWorkletNodeRef.current = null;
+    try { vadSourceNodeRef.current?.disconnect(); } catch {}
+    vadSourceNodeRef.current = null;
   }
 
   function stopVad() {
-    if (vadRafRef.current !== null) {
-      cancelAnimationFrame(vadRafRef.current);
-      vadRafRef.current = null;
-    }
-    analyserRef.current?.disconnect();
-    audioCtxRef.current?.close().catch(() => undefined);
-    audioCtxRef.current = null;
-    analyserRef.current = null;
+    stopVadNodes();
     setVadVolume(0);
     speechStartRef.current = null;
     silenceStartRef.current = null;
@@ -864,7 +847,7 @@ export default function ChatPage() {
     recorderRef.current = recorder;
     setRecordingState("recording");
 
-    if (!analyserRef.current) {
+    if (!vadWorkletNodeRef.current) {
       startVad(stream);
     }
   }

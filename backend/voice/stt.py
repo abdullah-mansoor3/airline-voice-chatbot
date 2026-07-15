@@ -8,8 +8,9 @@ from typing import Any
 
 from groq import AsyncGroq
 
+_PRIMARY_MODEL = "openai/gpt-oss-120b"
+_FALLBACK_MODEL = "openai/gpt-oss-20b"
 _TRANSCRIBE_MODEL = "whisper-large-v3"
-_TRANSLATE_MODEL = "whisper-large-v3"
 _DOMAIN_PROMPT = "پی آئی اے، ایئربلو، سیرین، ریفنڈ، منسوخ، ڈیلے، سامان، بکنگ، منسوخی"
 
 class SpeechToTextError(RuntimeError):
@@ -60,15 +61,12 @@ async def transcribe_audio(
 
     if language_hint is None:
         try:
-            r1, r2, r3 = await asyncio.gather(
+            r1, r2 = await asyncio.gather(
                 client.audio.transcriptions.create(
                     file=file_tuple, model=_TRANSCRIBE_MODEL, response_format="verbose_json"
                 ),
                 client.audio.transcriptions.create(
                     file=file_tuple, model=_TRANSCRIBE_MODEL, response_format="verbose_json", language="ur", prompt=_DOMAIN_PROMPT
-                ),
-                client.audio.translations.create(
-                    file=file_tuple, model=_TRANSLATE_MODEL, response_format="verbose_json"
                 ),
             )
         except Exception as exc:
@@ -76,7 +74,6 @@ async def transcribe_audio(
 
         text1 = _extract_text(r1)
         text2 = _extract_text(r2)
-        text3 = _extract_text(r3)
 
         detected_language = (getattr(r1, "language", None) or "unknown").lower()
         norm_lang = normalize_supported_language(detected_language)
@@ -89,7 +86,7 @@ async def transcribe_audio(
         else:
             text = text2
             language = "ur"
-            english_text = text3 if text3 and not _is_useless_translation(text3) else None
+            english_text = await _translate_text_urdu_to_english(text, client)
 
             # Sanity checks/logging
             if not _has_urdu_script(text) and not _has_devanagari(text):
@@ -108,12 +105,7 @@ async def transcribe_audio(
             transcribe_kwargs["prompt"] = _DOMAIN_PROMPT
 
         try:
-            transcribe_result, translate_result = await asyncio.gather(
-                client.audio.transcriptions.create(**transcribe_kwargs),
-                client.audio.translations.create(
-                    file=file_tuple, model=_TRANSLATE_MODEL, response_format="verbose_json"
-                ),
-            )
+            transcribe_result = await client.audio.transcriptions.create(**transcribe_kwargs)
         except Exception as exc:
             raise SpeechToTextError(f"Groq STT failed: {exc}") from exc
 
@@ -121,11 +113,9 @@ async def transcribe_audio(
         detected_language = (getattr(transcribe_result, "language", None) or "unknown").lower()
         language = language_hint
 
-        english_text = _extract_text(translate_result)
-        if english_text and _is_useless_translation(english_text):
-            english_text = None
-        if language == "en":
-            english_text = None
+        english_text = None
+        if language == "ur":
+            english_text = await _translate_text_urdu_to_english(text, client)
 
     if not text:
         raise SpeechToTextError("Groq STT returned an empty transcript.")
@@ -176,3 +166,52 @@ def _is_useless_translation(text: str) -> bool:
         return True
     words = re.findall(r"[A-Za-z\u0600-\u06ff]+", compact)
     return len(words) == 0
+
+async def _translate_text_urdu_to_english(text: str, client: AsyncGroq) -> str | None:
+    """Translate Urdu text to English using LLM chat completions."""
+    if not text or not _has_urdu_script(text):
+        return None
+
+    try:
+        response = await client.chat.completions.create(
+            model=_PRIMARY_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a professional translator. Translate the given Urdu text to English. Return only the English translation, nothing else. Do not add explanations or notes.",
+                },
+                {
+                    "role": "user",
+                    "content": text,
+                },
+            ],
+            temperature=0.2,
+            max_tokens=1024,
+        )
+        translated = response.choices[0].message.content
+        if translated and not _is_useless_translation(translated):
+            return translated.strip()
+    except Exception as exc:
+        print(f"LLM translation failed: {exc}")
+        try:
+            response = await client.chat.completions.create(
+                model=_FALLBACK_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a professional translator. Translate the given Urdu text to English. Return only the English translation, nothing else.",
+                    },
+                    {
+                        "role": "user",
+                        "content": text,
+                    },
+                ],
+                temperature=0.2,
+                max_tokens=1024,
+            )
+            translated = response.choices[0].message.content
+            if translated and not _is_useless_translation(translated):
+                return translated.strip()
+        except Exception as fallback_exc:
+            print(f"Fallback LLM translation failed: {fallback_exc}")
+    return None

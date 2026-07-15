@@ -306,6 +306,11 @@ async def voice_websocket(websocket: WebSocket) -> None:
                     audio_buffer = bytearray()
                     continue
                 tts_cancel_event.clear()
+                # Debug: log audio buffer size and mime type
+                print(f"DEBUG: Audio buffer size: {len(audio_buffer)} bytes, MIME type: {mime_type}")
+                if len(audio_buffer) == 0:
+                    await websocket.send_json({"type": "error", "message": "No audio data received"})
+                    continue
                 current_task = asyncio.create_task(
                     _handle_turn(
                         websocket,

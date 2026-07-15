@@ -75,7 +75,7 @@ def retrieve_policy_chunks(
 
     hits = _hits_from_response(response)
     chunks = [_chunk_from_hit(hit) for hit in hits]
-    return [c for c in chunks if c.score >= 0.45]
+    return chunks
 
 
 def expand_query_synonyms(query: str) -> str:
