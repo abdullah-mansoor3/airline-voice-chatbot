@@ -68,7 +68,7 @@ def parse_and_validate_agent_output(
 ) -> ValidationResult:
     warnings: list[str] = []
     payload = _extract_json(raw_text)
-    
+
     # Extract the markdown answer text (everything before the ```json block)
     text_part = re.sub(r"```(?:json)?.*?```", "", raw_text, flags=re.DOTALL | re.IGNORECASE).strip()
     # Fallback if no json block: just take the whole thing and strip {}
@@ -76,7 +76,14 @@ def parse_and_validate_agent_output(
         text_part = re.sub(r"\{.*?\}", "", raw_text, flags=re.DOTALL).strip()
     if not text_part:
         text_part = raw_text.strip()
-    
+
+    # Remove document IDs and citation markers from markdown text
+    # This removes patterns like 【id:chunk】, [id:chunk], or any UUID-like patterns in brackets
+    text_part = re.sub(r"【[^】]+】", "", text_part)  # Remove 【...】 citations
+    text_part = re.sub(r"\[[\da-fA-F-]+:\d+\]", "", text_part)  # Remove [uuid:chunk] citations
+    text_part = re.sub(r"\[[\da-fA-F-]{8}-[\da-fA-F-]{4}-[\da-fA-F-]{4}-[\da-fA-F-]{4}-[\da-fA-F-]{12}\]", "", text_part)  # Remove standalone UUIDs
+    text_part = re.sub(r"\s+", " ", text_part).strip()  # Clean up extra whitespace
+
     payload["answer_markdown"] = text_part
     allowed_ids = {chunk.get("id") for chunk in retrieved_chunks if chunk.get("id")}
     retrieved_by_id = {

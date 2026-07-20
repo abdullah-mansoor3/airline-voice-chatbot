@@ -19,11 +19,11 @@ from .shared import (
     PROGRESSIVE_INFORMATION_GATHERING,
     SAFETY_RULES,
     TRUST_HIERARCHY,
+    TTS_FRIENDLY_OUTPUT_RULES,
     URDU_LANGUAGE_RULES,
 )
 
-
-RESPONSE_GENERATOR_SYSTEM_MESSAGE = """{airline_identity}
+_RESPONSE_TEMPLATE = """{airline_identity}
 
 {trust_hierarchy}
 
@@ -49,7 +49,11 @@ RESPONSE_GENERATOR_SYSTEM_MESSAGE = """{airline_identity}
 
 When policy clauses are provided, ground legal answers only in those clauses. When no policy clauses are provided, answer from conversation memory, datetime context, flight results, or order context as appropriate. If flight results are empty, say no flights were found for that route/date. Stick to your role as an assistant, not a lawyer.
 
-{output_format_json}""".format(
+{output_format_json}
+
+{voice_output_rules}"""
+
+_FORMAT_KWARGS = dict(
     airline_identity=AIRLINE_ASSISTANT_IDENTITY,
     trust_hierarchy=TRUST_HIERARCHY,
     internal_details_protection=INTERNAL_DETAILS_PROTECTION,
@@ -63,4 +67,14 @@ When policy clauses are provided, ground legal answers only in those clauses. Wh
     error_recovery=ERROR_RECOVERY,
     booking_modification_confirmation=BOOKING_MODIFICATION_CONFIRMATION,
     output_format_json=OUTPUT_FORMAT_JSON,
+)
+
+RESPONSE_GENERATOR_SYSTEM_MESSAGE = _RESPONSE_TEMPLATE.format(
+  voice_output_rules="",
+  **_FORMAT_KWARGS,
+)
+
+VOICE_RESPONSE_GENERATOR_SYSTEM_MESSAGE = _RESPONSE_TEMPLATE.format(
+  voice_output_rules=TTS_FRIENDLY_OUTPUT_RULES,
+  **_FORMAT_KWARGS,
 )

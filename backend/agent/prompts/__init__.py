@@ -15,6 +15,7 @@ from .query_rewriter import (
 )
 from .response_generator import (
     RESPONSE_GENERATOR_SYSTEM_MESSAGE,
+    VOICE_RESPONSE_GENERATOR_SYSTEM_MESSAGE,
 )
 from .translator import (
     URDU_TRANSLATOR_SYSTEM_MESSAGE,
@@ -46,6 +47,7 @@ __all__ = [
     "build_query_rewriter_user_prompt",
     # Response Generator
     "RESPONSE_GENERATOR_SYSTEM_MESSAGE",
+    "VOICE_RESPONSE_GENERATOR_SYSTEM_MESSAGE",
     # Translator
     "URDU_TRANSLATOR_SYSTEM_MESSAGE",
     "build_urdu_translator_user_prompt",

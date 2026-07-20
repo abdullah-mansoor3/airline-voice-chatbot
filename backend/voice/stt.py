@@ -135,6 +135,26 @@ async def transcribe_audio(
     if not text:
         raise SpeechToTextError("Groq STT returned an empty transcript.")
 
+    if _is_hallucination(text):
+        raise SpeechToTextError(
+            f"No clear speech detected (possible silence or background noise). "
+            f"Whisper returned: {text!r}"
+        )
+
+    # ── Short-transcript / single-word noise filter ───────────────────────────
+    # Extract all meaningful word tokens (Latin + Urdu/Arabic scripts, min 2 chars each).
+    word_tokens = re.findall(r"[A-Za-z\u0600-\u06ff\u0750-\u077f\u0900-\u097f]{2,}", text.strip())
+    # A single word of ≤2 chars is almost always noise (ok, ha, یہ, ہا, etc.)
+    if len(word_tokens) == 1 and len(word_tokens[0]) <= 2:
+        raise SpeechToTextError(
+            f"Single very short word — likely noise. Whisper returned: {text!r}"
+        )
+    # Zero meaningful words (e.g. only digits or punctuation)
+    if len(word_tokens) == 0:
+        raise SpeechToTextError(
+            f"No recognisable words in transcript. Whisper returned: {text!r}"
+        )
+
     return TranscriptionResult(
         text=text,
         language=language,
@@ -181,6 +201,38 @@ def _is_useless_translation(text: str) -> bool:
         return True
     words = re.findall(r"[A-Za-z\u0600-\u06ff]+", compact)
     return len(words) == 0
+
+# Common Whisper hallucinations on silence / non-speech audio
+_HALLUCINATION_PATTERNS = re.compile(
+    r"^("
+    r"thank\s+you[\.\!\?]?|thanks[\.\!\?]?|"
+    r"شکریہ[\.\!\?]?|شکریا[\.\!\?]?|سکریا[\.\!\?]?|"
+    r"ہاں[\.\!\?،]?|ہاہاہا[\.\!\?،]?|ہا\s?ہا[\.\!\?،]?|"
+    r"ha\s?ha[\.\!\?]?|haha[\.\!\?]?|"
+    r"bye[\.\!\?]?|goodbye[\.\!\?]?|ok[\.\!\?]?|okay[\.\!\?]?|"
+    r"سبسکرائب[\w\s]*|subscribe[\w\s]*|"  # common YT hallucination
+    r"\[[\w\s]*\]|"  # [Music], [Applause], etc.
+    r"\([\w\s]*\)"  # (laughter), (coughing), etc.
+    r")$",
+    re.IGNORECASE | re.UNICODE,
+)
+
+def _is_hallucination(text: str) -> bool:
+    """Return True if the transcript looks like a Whisper silence hallucination."""
+    stripped = text.strip().strip(".,!؟?،")
+    if not stripped:
+        return True
+    # Very short outputs that are just punctuation / symbols
+    if len(stripped) <= 3 and not any(c.isalnum() for c in stripped):
+        return True
+    # Match known hallucination patterns
+    if _HALLUCINATION_PATTERNS.match(stripped):
+        return True
+    # Repetitive single character (e.g. "ہہہہہہ")
+    unique_chars = set(c for c in stripped if c.isalpha())
+    if unique_chars and len(unique_chars) == 1 and len(stripped) >= 3:
+        return True
+    return False
 
 async def _translate_text_urdu_to_english(text: str, client: AsyncGroq) -> str | None:
     """Translate Urdu text to English using LLM chat completions."""

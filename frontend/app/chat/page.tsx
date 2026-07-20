@@ -13,6 +13,9 @@ import { supabase } from "../../lib/supabase";
 type ConnectionState = "connecting" | "connected" | "closed";
 type RecordingState = "idle" | "recording" | "processing";
 type LanguageMode = "auto" | "en" | "ur";
+type AgentState = "IDLE" | "AGENT_BUSY";
+type ActionLock = "record" | "send-text" | "stop" | "mute" | "hands-free" | "release-buffer";
+type CancelReason = "manual" | "barge-in";
 
 type ServerEvent =
   | { type: "ready"; userId: string; conversationId: string | null }
@@ -66,11 +69,11 @@ type Citation = {
   id: string;
   title?: string | null;
   heading?: string | null;
-  jurisdiction?: string | null;
-  score?: number | null;
   originalText?: string | null;
-  sourceUrl?: string | null;
+  score?: number | null;
 };
+
+type QueuedAudio = Blob;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -79,7 +82,6 @@ const apiUrl = wsUrl.replace(/^ws/, "http").replace(/\/ws\/voice$/, "");
 
 // VAD settings (must match backend VadSettings defaults)
 const VAD_SILENCE_MS = 950;
-const VAD_BARGE_IN_THRESHOLD = 0.25;
 const VAD_MIN_SPEECH_MS = 450;
 const RMS_BUFFER_SIZE = 5;
 const MIN_SILENT_FRAMES = 3;
@@ -110,6 +112,7 @@ export default function ChatPage() {
   const [error, setError] = useState("");
   const [vadVolume, setVadVolume] = useState(0);
   const [isPlayingTts, setIsPlayingTts] = useState(false);
+  const [agentThinking, setAgentThinking] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
   const [debugTrace, setDebugTrace] = useState<Record<string, unknown>[]>([]);
   const [debugBundle, setDebugBundle] = useState<Record<string, unknown> | null>(null);
@@ -125,15 +128,15 @@ export default function ChatPage() {
   const silenceStartRef = useRef<number | null>(null);
   const vadRafRef = useRef<number | null>(null);
   const pendingChunksRef = useRef<Promise<void>[]>([]);
-  const audioQueueRef = useRef<Blob[]>([]);
-  const isPlayingRef = useRef(false);
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
   const currentAudioUrlRef = useRef<string | null>(null);
   const lastTurnWasVoiceRef = useRef(false);
   const pendingAutoListenRef = useRef(false);
   const conversationModeRef = useRef(false);
   const recordingStateRef = useRef<RecordingState>("idle");
+  const recordingStartedWhileBusyRef = useRef(false);
   const isProcessingRef = useRef(false);
+  const isStreamingRef = useRef(false);
   const handsFreeStreamRef = useRef<MediaStream | null>(null);
   const lastSpokenLanguageRef = useRef("ur");
   const waitNoticeAtRef = useRef(0);
@@ -151,7 +154,117 @@ export default function ChatPage() {
   const vadWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
   const vadSourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const vadWorkletLoadedRef = useRef(false);
-  const bargeInDebounceRef = useRef<number | null>(null);
+  const actionLockRef = useRef<ActionLock | null>(null);
+  const cancelSentForTurnRef = useRef(false);
+  const cancelReasonRef = useRef<CancelReason | null>(null);
+  const suppressTtsUntilProcessingRef = useRef(false);
+
+  // =======================================================================
+  // VOICE AGENT STATE MACHINE VARIABLES
+  // =======================================================================
+  // agentStateRef: The primary source of truth for the 3-way gate.
+  // It is only "IDLE" if the server turn is complete, no TTS is playing, and the queue is empty.
+  const agentStateRef = useRef<AgentState>("IDLE");
+
+  // isServerTurnCompleteRef: Tracks if the backend LLM is currently processing a request.
+  const isServerTurnCompleteRef = useRef(true);
+
+  // isPlayingRef: Tracks if the HTMLAudioElement is actively playing TTS audio.
+  const isPlayingRef = useRef(false);
+
+  // audioQueueRef: Holds pending TTS sentences from the current turn that haven't played yet.
+  const audioQueueRef = useRef<Blob[]>([]);
+
+  // =======================================================================
+  // DEFERRED AUDIO BUFFERING (User barges in while agent is BUSY)
+  // =======================================================================
+  const hasDeferredVoiceRef = useRef(false);
+  const deferredVoiceBlobRef = useRef<Blob | null>(null);
+  const deferredChunksRef = useRef<Blob[]>([]);
+  const deferredMimeRef = useRef<string>("audio/webm");
+
+  const pendingTtsPurposeRef = useRef<"notice" | "response" | undefined>(undefined);
+  const ttsPausedForUserSpeechRef = useRef(false);
+  const deferredRecorderRef = useRef<MediaRecorder | null>(null);
+
+  function withActionLock(action: ActionLock, fn: () => void | Promise<void>) {
+    if (actionLockRef.current) return;
+    actionLockRef.current = action;
+    try {
+      const result = fn();
+      if (result instanceof Promise) {
+        void result.finally(() => {
+          if (actionLockRef.current === action) actionLockRef.current = null;
+        });
+        return;
+      }
+    } finally {
+      if (actionLockRef.current === action) actionLockRef.current = null;
+    }
+  }
+
+  function sendJsonFrame(payload: Record<string, unknown>) {
+    const socket = wsRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+    socket.send(JSON.stringify(payload));
+    return true;
+  }
+
+  function sendCancelFrame(reason: CancelReason = "manual") {
+    if (cancelSentForTurnRef.current) return false;
+    if (!sendJsonFrame({ type: "cancel" })) return false;
+    cancelSentForTurnRef.current = true;
+    cancelReasonRef.current = reason;
+    suppressTtsUntilProcessingRef.current = true;
+    return true;
+  }
+
+  function beginLocalTurn(statusText: string) {
+    cancelSentForTurnRef.current = false;
+    cancelReasonRef.current = null;
+    isServerTurnCompleteRef.current = false;
+    setRecordingState("processing");
+    isProcessingRef.current = true;
+    setAgentThinking(true);
+    setStatus(statusText);
+    updateAgentState();
+  }
+
+  function clearDeferredVoiceBuffer() {
+    hasDeferredVoiceRef.current = false;
+    deferredVoiceBlobRef.current = null;
+    deferredChunksRef.current = [];
+  }
+
+  function resetVoiceTurnUi(statusText = "Ready") {
+    setRecordingState("idle");
+    isProcessingRef.current = false;
+    setAgentThinking(false);
+    setStatus(statusText);
+  }
+
+  function abortActiveRecording() {
+    const recorder = recorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      try {
+        recorder.ondataavailable = null;
+        recorder.onstop = null;
+        recorder.stop();
+      } catch {}
+    }
+    recorderRef.current = null;
+    const deferredRecorder = deferredRecorderRef.current;
+    if (deferredRecorder && deferredRecorder.state !== "inactive") {
+      try {
+        deferredRecorder.ondataavailable = null;
+        deferredRecorder.onstop = null;
+        deferredRecorder.stop();
+      } catch {}
+    }
+    deferredRecorderRef.current = null;
+    pendingChunksRef.current = [];
+    clearDeferredVoiceBuffer();
+  }
 
   function resetSessionState() {
     wsRef.current?.close();
@@ -159,7 +272,7 @@ export default function ChatPage() {
     stopVad();
     releaseHandsFreeStream();
     stopStream();
-    clearPlayback();
+    clearPlayback({ releaseDeferred: false });
     conversationIdRef.current = null;
     setConversationId(null);
     setConversations([]);
@@ -174,6 +287,78 @@ export default function ChatPage() {
     setIsAdmin(false);
     isAdminRef.current = false;
     setConnectionKey((key) => key + 1);
+    clearDeferredVoiceBuffer();
+    actionLockRef.current = null;
+    cancelSentForTurnRef.current = false;
+    cancelReasonRef.current = null;
+    suppressTtsUntilProcessingRef.current = false;
+    isServerTurnCompleteRef.current = true;
+    updateAgentState();
+    isStreamingRef.current = false; // Reset streaming
+  }
+
+  function updateAgentState({ releaseDeferred = true }: { releaseDeferred?: boolean } = {}) {
+    // The Three-Way Gate: Agent is busy if ANY of these are true.
+    const busy = !isServerTurnCompleteRef.current || isPlayingRef.current || audioQueueRef.current.length > 0;
+    const newState = busy ? "AGENT_BUSY" : "IDLE";
+
+    if (agentStateRef.current !== newState) {
+      console.log(`[AgentState] Transition: ${agentStateRef.current} -> ${newState}`);
+      console.log(`[AgentState] Debug -> isServerTurnComplete: ${isServerTurnCompleteRef.current}, isPlaying: ${isPlayingRef.current}, queueLength: ${audioQueueRef.current.length}`);
+      agentStateRef.current = newState;
+
+      if (newState === "IDLE" && releaseDeferred) {
+        console.log(`[AgentState] Agent is now IDLE. Checking for buffered queries...`);
+        releaseBufferedQuery();
+      }
+    }
+  }
+
+  function releaseBufferedQuery() {
+    if (!hasDeferredVoiceRef.current || !deferredVoiceBlobRef.current) {
+      console.log("[Buffer] No buffered query to release.");
+      return;
+    }
+
+    const blob = deferredVoiceBlobRef.current;
+    const mime = deferredMimeRef.current;
+
+    if (actionLockRef.current) {
+      console.log("[Buffer] Action lock active, leaving buffered query queued.");
+      return;
+    }
+
+    const socket = wsRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      console.error("[Buffer] Socket disconnected, dropping buffered query.");
+      clearDeferredVoiceBuffer();
+      return;
+    }
+
+    withActionLock("release-buffer", async () => {
+      console.log("[Buffer] Releasing buffered query to backend...");
+      clearDeferredVoiceBuffer();
+      beginLocalTurn("Processing buffered request…");
+
+      console.log("[Buffer] Sending JSON start frame and Audio Blob...");
+      if (!sendJsonFrame({ type: "start", mimeType: mime, languageMode })) {
+        isServerTurnCompleteRef.current = true;
+        resetVoiceTurnUi();
+        updateAgentState();
+        return;
+      }
+
+      const buffer = await blob.arrayBuffer();
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(buffer);
+        sendJsonFrame({ type: "stop" });
+        console.log("[Buffer] Buffered query successfully transmitted.");
+      } else {
+        isServerTurnCompleteRef.current = true;
+        resetVoiceTurnUi();
+        updateAgentState();
+      }
+    });
   }
 
   // ── Auth ───────────────────────────────────────────────────────────────────
@@ -196,11 +381,35 @@ export default function ChatPage() {
         }
       })();
     }
-    if (!conversationMode && recorderRef.current && recorderRef.current.state !== "inactive") {
-      stopRecording();
-    }
     if (!conversationMode) {
+      // ── Issue #4 fix: stop any active recording immediately ──
+      if (recorderRef.current && recorderRef.current.state !== "inactive") {
+        try {
+          recorderRef.current.onstop = null; // Prevent onstop from completing the turn
+          recorderRef.current.stop();
+        } catch {}
+        recorderRef.current = null;
+
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          sendCancelFrame("manual");
+        }
+      }
+      // Stop the deferred recorder too if it exists
+      if (deferredRecorderRef.current && deferredRecorderRef.current.state !== "inactive") {
+        try {
+          deferredRecorderRef.current.onstop = null;
+          deferredRecorderRef.current.stop();
+        } catch {}
+        deferredRecorderRef.current = null;
+      }
+
+      stopVad();
       releaseHandsFreeStream();
+      // Clear ALL buffered/deferred audio when hands-free is turned off
+      clearDeferredVoiceBuffer();
+      pendingChunksRef.current = [];
+      resetVoiceTurnUi();
+      setStatus("Ready");
     }
   }, [conversationMode]);
 
@@ -219,6 +428,13 @@ export default function ChatPage() {
   useEffect(() => {
     connectionRef.current = connection;
   }, [connection]);
+
+  useEffect(() => {
+    if (error) {
+      const timer = setTimeout(() => setError(""), 3000);
+      return () => clearTimeout(timer);
+    }
+  }, [error]);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
@@ -252,6 +468,9 @@ export default function ChatPage() {
       wsRef.current = null;
       setConnection("closed");
       setStatus("Login required");
+      // ── Issue #2 fix: clear stale conversation list when logged out ──
+      setConversations([]);
+      setMessages([]);
       return;
     }
     loadConversations();
@@ -280,8 +499,12 @@ export default function ChatPage() {
 
     socket.onmessage = async (message) => {
       if (message.data instanceof Blob) {
+        if (suppressTtsUntilProcessingRef.current || (cancelSentForTurnRef.current && isServerTurnCompleteRef.current)) {
+          return;
+        }
         // Phase 2: queue TTS audio blobs and play them sequentially.
         audioQueueRef.current.push(message.data);
+        updateAgentState();
         drainAudioQueue();
         return;
       }
@@ -293,19 +516,36 @@ export default function ChatPage() {
     socket.onerror = () => {
       setError("WebSocket connection failed.");
       setStatus("Disconnected");
+      clearPlayback({ releaseDeferred: false });
+      clearDeferredVoiceBuffer();
+      isServerTurnCompleteRef.current = true;
+      cancelSentForTurnRef.current = false;
+      cancelReasonRef.current = null;
+      suppressTtsUntilProcessingRef.current = false;
+      resetVoiceTurnUi("Disconnected");
+      updateAgentState();
     };
 
     socket.onclose = () => {
       setConnection("closed");
       setStatus("Disconnected");
-      clearPlayback();
+      clearPlayback({ releaseDeferred: false });
+      clearDeferredVoiceBuffer();
+      pendingChunksRef.current = [];
+      isServerTurnCompleteRef.current = true;
+      cancelSentForTurnRef.current = false;
+      cancelReasonRef.current = null;
+      suppressTtsUntilProcessingRef.current = false;
+      resetVoiceTurnUi("Disconnected");
+      updateAgentState();
     };
 
     return () => {
       socket.close();
       releaseHandsFreeStream();
       stopStream();
-      clearPlayback();
+      clearPlayback({ releaseDeferred: false });
+      clearDeferredVoiceBuffer();
     };
   }, [session, connectionKey]);
 
@@ -335,10 +575,19 @@ export default function ChatPage() {
     currentAudioUrlRef.current = url;
     const audio = new Audio(url);
     currentAudioRef.current = audio;
-    audio.onended = () => {
+
+    const finishCurrentAudio = () => {
+      if (currentAudioRef.current !== audio) return false;
       cleanupCurrentAudio();
       isPlayingRef.current = false;
-      // Check for barge-in energy before playing the next sentence
+      return true;
+    };
+
+    audio.onended = () => {
+      if (ttsPausedForUserSpeechRef.current) return;
+      if (!finishCurrentAudio()) return;
+      updateAgentState();
+
       if (audioQueueRef.current.length > 0) {
         drainAudioQueue();
       } else {
@@ -346,17 +595,19 @@ export default function ChatPage() {
         maybeAutoListen();
       }
     };
+
     audio.onerror = () => {
-      cleanupCurrentAudio();
-      isPlayingRef.current = false;
+      if (!finishCurrentAudio()) return;
       setIsPlayingTts(false);
-      drainAudioQueue();
+      updateAgentState();
+      if (audioQueueRef.current.length > 0) drainAudioQueue();
     };
+
     audio.play().catch(() => {
-      cleanupCurrentAudio();
-      isPlayingRef.current = false;
+      if (!finishCurrentAudio()) return;
       setIsPlayingTts(false);
-      drainAudioQueue();
+      updateAgentState();
+      if (audioQueueRef.current.length > 0) drainAudioQueue();
     });
   }
 
@@ -368,12 +619,32 @@ export default function ChatPage() {
     currentAudioUrlRef.current = null;
   }
 
-  function clearPlayback() {
-    currentAudioRef.current?.pause();
+  function playPleaseWaitNotice() {
+    sendCancelFrame("barge-in");
+    clearPlayback();
+
+    if ('speechSynthesis' in window) {
+      const utterance = new SpeechSynthesisUtterance(
+        lastSpokenLanguageRef.current === 'ur' ? '\u0628\u0631\u0627\u06c1 \u06a9\u0631\u0645 \u0627\u0646\u062a\u0638\u0627\u0631 \u06a9\u0631\u06cc\u06ba' : 'Please wait'
+      );
+      utterance.lang = lastSpokenLanguageRef.current === 'ur' ? 'ur-PK' : 'en-US';
+      window.speechSynthesis.speak(utterance);
+    }
+  }
+
+  function clearPlayback({ releaseDeferred = true }: { releaseDeferred?: boolean } = {}) {
+    const audio = currentAudioRef.current;
+    if (audio) {
+      audio.onended = null;
+      audio.onerror = null;
+      audio.pause();
+    }
     cleanupCurrentAudio();
     audioQueueRef.current = [];
     isPlayingRef.current = false;
     setIsPlayingTts(false);
+    ttsPausedForUserSpeechRef.current = false;
+    updateAgentState({ releaseDeferred });
   }
 
   function playTtsErrorMessages(messageEn: string, messageUr: string) {
@@ -398,6 +669,14 @@ export default function ChatPage() {
   // ── Server Event Handler ───────────────────────────────────────────────────
 
   function handleServerEvent(event: ServerEvent) {
+    if (
+      cancelSentForTurnRef.current &&
+      isServerTurnCompleteRef.current &&
+      ["processing", "transcript", "agent_token", "agent_response", "tts_audio", "tts_error", "turn_complete"].includes(event.type)
+    ) {
+      return;
+    }
+
     switch (event.type) {
       case "ready":
         setStatus("Ready");
@@ -440,6 +719,10 @@ export default function ChatPage() {
         break;
 
       case "processing":
+        suppressTtsUntilProcessingRef.current = false;
+        isServerTurnCompleteRef.current = false;
+        cancelSentForTurnRef.current = false;
+        updateAgentState();
         isProcessingRef.current = true;
         setStatus(
           event.stage === "stt"
@@ -449,12 +732,18 @@ export default function ChatPage() {
               : "Speaking…",
         );
         setRecordingState("processing");
+        if (event.stage === "stt" || event.stage === "agent") {
+          setAgentThinking(true);
+        }
         break;
 
       case "transcript":
         lastSpokenLanguageRef.current = event.language;
         setCurrentTranscript(event.text);
         setDetectedLanguage(event.language);
+
+        console.log("[Transcript] Received and showing immediately:", event.text);
+
         setMessages((prev) => [
           ...prev,
           {
@@ -495,6 +784,7 @@ export default function ChatPage() {
 
       case "agent_response":
         isProcessingRef.current = false;
+        setAgentThinking(false);
         setRecordingState("idle");
         setCurrentResponse(event.text);
         setMessages((prev) => {
@@ -531,6 +821,7 @@ export default function ChatPage() {
       case "tts_audio":
         // The next WebSocket binary message is TTS audio of this size.
         nextExpectedBytesRef.current = event.bytes;
+        updateAgentState();
         break;
 
       case "tts_error":
@@ -539,23 +830,28 @@ export default function ChatPage() {
         break;
 
       case "turn_complete":
-        isProcessingRef.current = false;
-        setStatus("Ready");
-        setRecordingState("idle");
-        // In hands-free mode auto-listen after any turn (voice or text)
+        isServerTurnCompleteRef.current = true;
+        const willReleaseOnComplete = hasDeferredVoiceRef.current && !!deferredVoiceBlobRef.current;
+        updateAgentState();
+
+        if (!willReleaseOnComplete) {
+          isProcessingRef.current = false;
+          setAgentThinking(false);
+          setStatus("Ready");
+          setRecordingState("idle");
+        }
+
         if (conversationModeRef.current) {
           pendingAutoListenRef.current = true;
         }
-        if (!isPlayingRef.current && audioQueueRef.current.length === 0) {
-          setIsPlayingTts(false);
-          maybeAutoListen();
-        }
+        maybeAutoListen();
         loadConversations();
         break;
 
       case "voice_mode_end":
         pendingAutoListenRef.current = false;
         isProcessingRef.current = false;
+        setAgentThinking(false);
         setConversationMode(false);
         releaseHandsFreeStream();
         setStatus("Voice mode ended");
@@ -563,21 +859,43 @@ export default function ChatPage() {
         break;
 
       case "cancelled":
-        isProcessingRef.current = false;
-        clearPlayback();
+        if (!cancelSentForTurnRef.current && !isServerTurnCompleteRef.current) {
+          break;
+        }
+
+        const cancelledForBargeIn = cancelReasonRef.current === "barge-in";
+        const hadDeferredOnCancel = hasDeferredVoiceRef.current && !!deferredVoiceBlobRef.current;
+        cancelSentForTurnRef.current = false;
+        cancelReasonRef.current = null;
+        if (!cancelledForBargeIn || !hadDeferredOnCancel) {
+          suppressTtsUntilProcessingRef.current = false;
+        }
+        isServerTurnCompleteRef.current = true;
+        if (!cancelledForBargeIn) {
+          clearDeferredVoiceBuffer();
+        }
+        clearPlayback({ releaseDeferred: cancelledForBargeIn });
+        if (!cancelledForBargeIn || !hadDeferredOnCancel) {
+          resetVoiceTurnUi();
+        }
+        updateAgentState({ releaseDeferred: cancelledForBargeIn });
+
         if (conversationModeRef.current) {
           pendingAutoListenRef.current = true;
         }
-        setStatus("Ready");
-        setRecordingState("idle");
         maybeAutoListen();
         break;
 
       case "error":
-        isProcessingRef.current = false;
+        clearDeferredVoiceBuffer();
+        cancelSentForTurnRef.current = false;
+        cancelReasonRef.current = null;
+        suppressTtsUntilProcessingRef.current = false;
+        isServerTurnCompleteRef.current = true;
+        clearPlayback({ releaseDeferred: false });
+        resetVoiceTurnUi();
         setError(event.message);
-        setStatus("Ready");
-        setRecordingState("idle");
+        updateAgentState({ releaseDeferred: false });
         if (conversationModeRef.current) {
           pendingAutoListenRef.current = true;
           maybeAutoListen();
@@ -716,34 +1034,17 @@ export default function ChatPage() {
         if (type === "volume") {
           setVadVolume(Math.min(rms * 8, 1));
         } else if (type === "speech_start") {
-          if (isPlayingRef.current) {
-            interruptAssistantAndListen();
-          } else if (recordingStateRef.current !== "recording") {
-            void startRecording();
+          if (recordingStateRef.current !== "recording") {
+            if (conversationModeRef.current) {
+              void startRecording();
+            } else if (!isPlayingRef.current && agentStateRef.current === "IDLE") {
+              void startRecording();
+            }
           }
         } else if (type === "speech_end") {
           if (recordingStateRef.current === "recording") {
             stopRecording();
           }
-        } else if (type === "barge_in_candidate") {
-          // Debounce to prevent rapid repeated interrupts
-          if (bargeInDebounceRef.current) {
-            clearTimeout(bargeInDebounceRef.current);
-          }
-
-          bargeInDebounceRef.current = window.setTimeout(() => {
-            bargeInDebounceRef.current = null;
-
-            // Only interrupt if TTS is still playing
-            if (isPlayingRef.current) {
-              // Accept the barge-in candidate
-              workletNode.port.postMessage({ type: 'accept_barge_in' });
-              interruptAssistantAndListen();
-            } else {
-              // Reject the barge-in candidate (no longer relevant)
-              workletNode.port.postMessage({ type: 'reject_barge_in' });
-            }
-          }, 50); // 50ms debounce to ensure TTS state is stable
         } else if (type === "debug") {
           console.log('[VAD Debug]', event.data);
         }
@@ -774,6 +1075,8 @@ export default function ChatPage() {
   // ── Recording ─────────────────────────────────────────────────────────────
 
   async function startRecording() {
+    if (actionLockRef.current || recordingStateRef.current !== "idle") return;
+    actionLockRef.current = "record";
     setError("");
     setCurrentTranscript("");
     setCurrentResponse("");
@@ -783,6 +1086,7 @@ export default function ChatPage() {
     const socket = wsRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       setError("WebSocket is not connected.");
+      actionLockRef.current = null;
       return;
     }
 
@@ -801,6 +1105,7 @@ export default function ChatPage() {
         });
       } catch {
         setError("Microphone access was denied.");
+        actionLockRef.current = null;
         return;
       }
       if (conversationModeRef.current) {
@@ -810,13 +1115,54 @@ export default function ChatPage() {
     streamRef.current = stream;
 
     const mimeType = pickMimeType();
-    const recorder = new MediaRecorder(
-      stream,
-      mimeType ? { mimeType } : undefined,
-    );
+    let recorder: MediaRecorder;
+    try {
+      recorder = new MediaRecorder(
+        stream,
+        mimeType ? { mimeType } : undefined,
+      );
+    } catch {
+      setError("This browser cannot record microphone audio.");
+      stopStream();
+      actionLockRef.current = null;
+      return;
+    }
+
+    const isBusy = agentStateRef.current === "AGENT_BUSY";
+    recordingStartedWhileBusyRef.current = isBusy;
+
+    // Always record the MIME so onstop can build a valid Blob regardless of path.
+    deferredMimeRef.current = recorder.mimeType || "audio/webm";
+
+    if (isBusy) {
+      deferredChunksRef.current = [];
+    } else {
+      pendingChunksRef.current = [];
+      sendJsonFrame({
+        type: "start",
+        mimeType: recorder.mimeType,
+        languageMode,
+      });
+      cancelSentForTurnRef.current = false;
+      isServerTurnCompleteRef.current = false;
+      updateAgentState();
+    }
 
     recorder.ondataavailable = async (event) => {
-      if (event.data.size === 0 || socket.readyState !== WebSocket.OPEN) return;
+      if (event.data.size === 0) return;
+
+      // isBusy is intentionally a stale closure captured at recording start.
+      // updateAgentState() is called right after we send "start", which sets
+      // agentStateRef to AGENT_BUSY. Reading it live here would make every
+      // chunk look busy and route everything to deferredChunksRef, silently
+      // killing the turn. The closure correctly reflects whether the agent
+      // was busy BEFORE this turn began.
+      if (isBusy) {
+        deferredChunksRef.current.push(event.data);
+        return;
+      }
+
+      if (socket.readyState !== WebSocket.OPEN) return;
       const pending = event.data.arrayBuffer().then((buffer) => {
         if (socket.readyState === WebSocket.OPEN) socket.send(buffer);
       });
@@ -825,34 +1171,52 @@ export default function ChatPage() {
     };
 
     recorder.onstop = async () => {
-      await Promise.all(pendingChunksRef.current);
-      pendingChunksRef.current = [];
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ type: "stop" }));
+      const currentlyBusy = agentStateRef.current === "AGENT_BUSY";
+      const startedWhileBusy = recordingStartedWhileBusyRef.current;
+
+      if (deferredChunksRef.current.length > 0) {
+        const blob = new Blob(deferredChunksRef.current, { type: deferredMimeRef.current });
+        deferredVoiceBlobRef.current = blob;
+        hasDeferredVoiceRef.current = true;
+        deferredChunksRef.current = [];
+
+        if (currentlyBusy) {
+          playPleaseWaitNotice();
+        } else if (startedWhileBusy) {
+          releaseBufferedQuery();
+        }
+      } else {
+        await Promise.all(pendingChunksRef.current);
+        pendingChunksRef.current = [];
+        if (socket.readyState === WebSocket.OPEN) {
+          sendJsonFrame({ type: "stop" });
+        }
       }
+
       recorderRef.current = null;
-      isProcessingRef.current = true;
+      // Read agent state live — isBusy closure was captured at recording start and may be stale.
+      if (!startedWhileBusy) {
+        isProcessingRef.current = true;
+      }
+      // When agent is busy, isProcessingRef stays as-is — the server turn is still
+      // in flight so thinking-dots / stop-button must remain visible.
       stopVad();
       if (!conversationModeRef.current) stopStream();
     };
 
-    socket.send(
-      JSON.stringify({
-        type: "start",
-        mimeType: recorder.mimeType,
-        languageMode,
-      }),
-    );
     recorder.start(250);
     recorderRef.current = recorder;
     setRecordingState("recording");
+    setStatus("Listening…");
+    if (actionLockRef.current === "record") actionLockRef.current = null;
 
     if (!vadWorkletNodeRef.current) {
-      startVad(stream);
+      void startVad(stream);
     }
   }
 
   function stopRecording() {
+    if (actionLockRef.current === "stop" || actionLockRef.current === "mute") return;
     const recorder = recorderRef.current;
     if (recorder && recorder.state !== "inactive") {
       try {
@@ -865,8 +1229,19 @@ export default function ChatPage() {
     stopVad();
     speechStartRef.current = null;
     silenceStartRef.current = null;
-    setRecordingState("processing");
-    isProcessingRef.current = true;
+    const startedWhileBusy = recordingStartedWhileBusyRef.current;
+    if (!startedWhileBusy) {
+      setRecordingState("processing");
+      isProcessingRef.current = true;
+      setAgentThinking(true);
+      setStatus("Transcribing…");
+    } else {
+      // ── Issue #5 fix: agent is still thinking/streaming – only reset the
+      // recording state (so mic shows as idle) but leave isProcessingRef
+      // alone so the thinking-dots and stop-generation button stay visible.
+      setRecordingState("idle");
+      // isProcessingRef stays as-is – the server turn is still in flight
+    }
   }
 
   function stopStream() {
@@ -882,79 +1257,81 @@ export default function ChatPage() {
   }
 
   function stopAgentGeneration() {
-    const socket = wsRef.current;
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "cancel" }));
-    }
-    clearPlayback();
-    stopVad();
-    if (conversationModeRef.current) {
-      pendingAutoListenRef.current = true;
-    } else {
-      pendingAutoListenRef.current = false;
-    }
-    setRecordingState("idle");
-    isProcessingRef.current = false;
-    setStatus("Ready");
+    withActionLock("stop", () => {
+      sendCancelFrame("manual");
+      abortActiveRecording();
+      isServerTurnCompleteRef.current = true;
+      clearPlayback({ releaseDeferred: false });
+      stopVad();
+      resetVoiceTurnUi();
+      updateAgentState({ releaseDeferred: false });
+
+      if (conversationModeRef.current) {
+        pendingAutoListenRef.current = true;
+        maybeAutoListen();
+      } else {
+        pendingAutoListenRef.current = false;
+      }
+    });
   }
 
   function muteAssistantVoice() {
-    const socket = wsRef.current;
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "cancel" }));
-    }
-    clearPlayback();
-    setRecordingState("idle");
-    isProcessingRef.current = false;
-    setStatus("Ready");
-    if (conversationModeRef.current) {
-      pendingAutoListenRef.current = true;
-      maybeAutoListen();
-    }
+    withActionLock("mute", () => {
+      sendCancelFrame("manual");
+      abortActiveRecording();
+      isServerTurnCompleteRef.current = true;
+      clearPlayback({ releaseDeferred: false });
+      resetVoiceTurnUi();
+      updateAgentState({ releaseDeferred: false });
+
+      if (conversationModeRef.current) {
+        pendingAutoListenRef.current = true;
+        maybeAutoListen();
+      }
+    });
   }
 
   function interruptAssistantAndListen() {
-    const socket = wsRef.current;
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "cancel" }));
-    }
-    clearPlayback();
+    sendCancelFrame("manual");
+    clearDeferredVoiceBuffer();
+    isServerTurnCompleteRef.current = true;
+    clearPlayback({ releaseDeferred: false });
     stopVad();
     pendingAutoListenRef.current = false;
     setRecordingState("idle");
     isProcessingRef.current = false;
     setStatus("Listening…");
     if (conversationModeRef.current && recordingStateRef.current === "idle") {
-      window.setTimeout(() => {
-        if (
-          conversationModeRef.current &&
-          recordingStateRef.current === "idle" &&
-          wsRef.current?.readyState === WebSocket.OPEN
-        ) {
-          startRecording();
-        }
-      }, 100);
+      maybeAutoListen();
     }
   }
 
   function sendTextMessage() {
-    const text = textDraft.trim();
-    const socket = wsRef.current;
-    if (!text) return;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      setError("WebSocket is not connected.");
-      return;
-    }
-    setError("");
-    setCurrentTranscript(text);
-    setCurrentResponse("");
-    setTextDraft("");
-    setRecordingState("processing");
-    setDebugTrace([]);
-    setDebugBundle(null);
-    lastTurnWasVoiceRef.current = false;
+    withActionLock("send-text", () => {
+      const text = textDraft.trim();
+      if (!text) return;
+      if (agentStateRef.current !== "IDLE" || recordingStateRef.current !== "idle") {
+        setError("Please wait for the current turn to finish.");
+        return;
+      }
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+        setError("WebSocket is not connected.");
+        return;
+      }
+      setError("");
+      setCurrentTranscript(text);
+      setCurrentResponse("");
+      setTextDraft("");
+      setDebugTrace([]);
+      setDebugBundle(null);
+      lastTurnWasVoiceRef.current = false;
 
-    socket.send(JSON.stringify({ type: "text_message", text, languageMode }));
+      if (!sendJsonFrame({ type: "text_message", text, languageMode })) {
+        setError("WebSocket is not connected.");
+        return;
+      }
+      beginLocalTurn("Generating…");
+    });
   }
 
   function maybeAutoListen() {
@@ -962,22 +1339,14 @@ export default function ChatPage() {
     if (
       !sessionRef.current ||
       connectionRef.current !== "connected" ||
-      recordingStateRef.current !== "idle"
+      recordingStateRef.current !== "idle" ||
+      agentStateRef.current !== "IDLE" ||
+      isPlayingRef.current
     ) {
       return;
     }
     pendingAutoListenRef.current = false;
-    // Small delay to let TTS finish and AudioContext drain
-    window.setTimeout(() => {
-      if (
-        conversationModeRef.current &&
-        recordingStateRef.current === "idle" &&
-        !isPlayingRef.current &&
-        wsRef.current?.readyState === WebSocket.OPEN
-      ) {
-        startRecording();
-      }
-    }, 500);
+    void startRecording();
   }
 
   // ── Auth Actions ──────────────────────────────────────────────────────────
@@ -1010,6 +1379,8 @@ export default function ChatPage() {
     setError("");
     if (!session) return;
 
+    // ── Issue #1 fix: optimistic removal – remove from UI immediately,
+    // only restore if the backend returns a real error (not 404).
     const convoToRestore = conversations.find((c) => c.id === id);
     setConversations((prev) => prev.filter((c) => c.id !== id));
 
@@ -1028,12 +1399,9 @@ export default function ChatPage() {
       },
     });
 
-    if (!response.ok) {
+    if (!response.ok && response.status !== 404) {
+      // Real failure – restore the item in the UI
       const message = await response.text();
-      if (response.status === 404) {
-        await loadConversations();
-        return;
-      }
       setError(message || "Could not delete conversation.");
       if (convoToRestore) {
         setConversations((prev) => {
@@ -1042,9 +1410,9 @@ export default function ChatPage() {
           return restored;
         });
       }
-      return;
     }
-    await loadConversations();
+    // On success or 404 we intentionally do NOT call loadConversations()
+    // so rapid-delete clicks don't cause items to reappear.
   }
 
   async function loadMessages(id: string) {
@@ -1148,8 +1516,9 @@ export default function ChatPage() {
   const hasStreamingAgent = messages.some(
     (msg) => msg.speaker === "agent" && msg.isStreaming,
   );
-  const showProcessingBubble = isProcessing && !hasStreamingAgent;
-  const canRecord = !!session && isConnected && !isRecording && !isProcessing;
+  const showProcessingBubble = agentThinking && !hasStreamingAgent;
+  const canRecord = !!session && isConnected && !isRecording && !isProcessing && !agentThinking && !isPlayingTts;
+  const canSendText = !!session && isConnected && !isRecording && !isProcessing && !agentThinking && !isPlayingTts;
 
   const barWidth = `${Math.round(vadVolume * 100)}%`;
 
@@ -1382,7 +1751,7 @@ export default function ChatPage() {
           <div className="modeRow compactModeRow">
             <button
               className={`voiceToggle ${conversationMode ? "active" : ""}`}
-              onClick={() => setConversationMode((value) => !value)}
+              onClick={() => withActionLock("hands-free", () => setConversationMode((value) => !value))}
               type="button"
               aria-pressed={conversationMode}
             >
@@ -1398,7 +1767,7 @@ export default function ChatPage() {
           <div className="composerRow">
             <textarea
               className="composerInput"
-              disabled={!session || !isConnected || isRecording || isProcessing}
+              disabled={!canSendText}
               onChange={(event) => setTextDraft(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey) {
@@ -1411,10 +1780,10 @@ export default function ChatPage() {
               value={textDraft}
             />
 
-            {!isRecording && !isProcessing && !isPlayingTts ? (
+            {!isRecording && !isProcessing && !isPlayingTts && !agentThinking ? (
               <button
                 className="sendBtn"
-                disabled={!session || !isConnected || !textDraft.trim()}
+                disabled={!canSendText || !textDraft.trim()}
                 onClick={sendTextMessage}
                 type="button"
                 aria-label="Send text"
@@ -1423,7 +1792,7 @@ export default function ChatPage() {
               </button>
             ) : null}
 
-            {isRecording ? (
+            {isRecording && (
               <button
                 className="micBtn sendVoiceBtn"
                 onClick={stopRecording}
@@ -1433,7 +1802,9 @@ export default function ChatPage() {
                 <span className="controlIcon sendVoiceIcon" aria-hidden="true" />
                 Send voice
               </button>
-            ) : isProcessing ? (
+            )}
+
+            {agentThinking && (
               <button
                 className="stopGenerationBtn iconStopBtn"
                 onClick={stopAgentGeneration}
@@ -1443,7 +1814,9 @@ export default function ChatPage() {
                 <span className="controlIcon stopIcon" aria-hidden="true" />
                 Stop generating
               </button>
-            ) : isPlayingTts ? (
+            )}
+
+            {isPlayingTts && (
               <button
                 className="muteVoiceBtn iconStopBtn"
                 onClick={muteAssistantVoice}
@@ -1453,7 +1826,9 @@ export default function ChatPage() {
                 <span className="controlIcon muteIcon" aria-hidden="true" />
                 Mute voice
               </button>
-            ) : (
+            )}
+
+            {!isRecording && !agentThinking && !isPlayingTts && (
               <button
                 id="record-btn"
                 className={`micBtn ${!canRecord ? "disabled" : ""}`}
