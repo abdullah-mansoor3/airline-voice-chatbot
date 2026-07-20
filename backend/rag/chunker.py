@@ -42,8 +42,14 @@ class PolicyChunk:
 def chunk_policy_file(path: str | Path) -> tuple[PolicyDocument, list[PolicyChunk]]:
     path = Path(path)
     raw_text = path.read_text(encoding="utf-8")
+    return chunk_policy_text(raw_text, source_name=path.name, path_for_inference=path)
+
+
+def chunk_policy_text(
+    raw_text: str, source_name: str, path_for_inference: Path | None = None
+) -> tuple[PolicyDocument, list[PolicyChunk]]:
     frontmatter, body = _split_frontmatter(raw_text)
-    document = _document_from_frontmatter(path, frontmatter, body)
+    document = _document_from_frontmatter(source_name, frontmatter, body, path_for_inference)
     sections = _split_sections(body)
 
     chunks: list[PolicyChunk] = []
@@ -100,13 +106,20 @@ def _parse_loose_frontmatter(frontmatter_text: str) -> dict[str, str]:
 
 
 def _document_from_frontmatter(
-    path: Path, frontmatter: dict[str, Any], body: str
+    source_name: str, frontmatter: dict[str, Any], body: str, path_for_inference: Path | None = None
 ) -> PolicyDocument:
-    title = _first_heading(body) or path.stem.replace("_", " ").title()
-    category = _as_list(frontmatter.get("category") or _infer_category(path))
+    title = _first_heading(body) or source_name.replace("_", " ").replace(".md", "").title()
+    if title and len(title) > 200:
+        title = title[:197] + "..."
+    
+    # Fallbacks for category/jurisdiction if path isn't provided
+    default_cat = _infer_category(path_for_inference) if path_for_inference else "customer_refund"
+    default_jur = _infer_jurisdiction(path_for_inference, frontmatter) if path_for_inference else "international"
+    
+    category = _as_list(frontmatter.get("category") or default_cat)
     carrier = frontmatter.get("carrier")
     regulator = frontmatter.get("regulator")
-    jurisdiction = _infer_jurisdiction(path, frontmatter)
+    jurisdiction = default_jur if path_for_inference else (frontmatter.get("jurisdiction") or "international")
 
     return PolicyDocument(
         title=title,
@@ -197,7 +210,10 @@ def _first_heading(body: str) -> str | None:
 
 
 def _clean_heading(heading: str) -> str:
-    return heading.strip().lstrip("#").strip()
+    cleaned = heading.strip().lstrip("#").strip()
+    if len(cleaned) > 200:
+        cleaned = cleaned[:197] + "..."
+    return cleaned
 
 
 def _as_list(value: Any) -> list[str]:

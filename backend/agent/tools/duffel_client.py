@@ -73,16 +73,22 @@ class DuffelClient:
             "Duffel-Version": self.duffel_version,
             "Accept": "application/json",
         }
+        
+        # Log request payload
+        print(f"DUFFEL REQUEST: POST {path} payload={json}")
+
         async with httpx.AsyncClient(
             base_url=self.base_url,
             headers=headers,
             timeout=self.timeout,
         ) as client:
             response = await client.request(method, path, json=json)
+            
         if response.status_code >= 400:
+            print(f"DUFFEL ERROR RESPONSE: {response.status_code} {response.text}")
             raise DuffelError(
                 f"Duffel {method} {path} failed with {response.status_code}: "
-                f"{response.text[:500]}"
+                f"{response.text}"
             )
         parsed = response.json()
         return parsed if isinstance(parsed, dict) else {"data": parsed}

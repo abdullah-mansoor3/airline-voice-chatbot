@@ -195,9 +195,9 @@ def _jurisdiction_mismatched_citations(
     if not expected_jurisdiction:
         return set()
     if expected_jurisdiction == "international":
-        allowed = {"international"}
+        allowed = {"international", "web"}
     else:
-        allowed = {expected_jurisdiction}
+        allowed = {expected_jurisdiction, "web"}
 
     mismatched: set[str] = set()
     for chunk_id in cited_chunk_ids:

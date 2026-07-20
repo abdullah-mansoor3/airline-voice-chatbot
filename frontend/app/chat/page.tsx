@@ -22,7 +22,7 @@ type ServerEvent =
   | { type: "conversation_created"; conversationId: string }
   | { type: "auth_required"; message: string }
   | { type: "recording_started" }
-  | { type: "processing"; stage: "stt" | "agent" | "tts" }
+  | { type: "processing"; stage: string }
   | { type: "transcript"; text: string; englishText?: string | null; language: string; detectedLanguage?: string }
   | { type: "agent_response"; text: string; language: string; citations?: Citation[] }
   | { type: "agent_token"; text: string }
@@ -729,10 +729,12 @@ export default function ChatPage() {
             ? "Transcribing…"
             : event.stage === "agent"
               ? "Generating…"
-              : "Speaking…",
+              : event.stage === "tts"
+              ? "Speaking…"
+              : event.stage.charAt(0).toUpperCase() + event.stage.slice(1) + "…"
         );
         setRecordingState("processing");
-        if (event.stage === "stt" || event.stage === "agent") {
+        if (event.stage !== "tts") {
           setAgentThinking(true);
         }
         break;
@@ -1529,7 +1531,7 @@ export default function ChatPage() {
       {/* Sidebar */}
       <aside className={`sidebar ${sidebarExpanded ? "expanded" : "collapsed"}`}>
         <div className="sidebarTop">
-          <div className="brandMark">
+          <Link href="/" className="brandMark" style={{ textDecoration: 'none' }}>
             <div className="brandIcon" aria-hidden="true" />
             {sidebarExpanded ? (
               <div>
@@ -1537,7 +1539,7 @@ export default function ChatPage() {
                 <p className="brandName">Claim Desk</p>
               </div>
             ) : null}
-          </div>
+          </Link>
           <button
             className="sidebarToggle"
             onClick={() => setSidebarExpanded((value) => !value)}

@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 
 type AdminTab = "chain" | "memory" | "users";
 
@@ -349,9 +350,18 @@ export function AdminDebugPanel({
       <div className="adminPane">
         <div className="adminPaneHeader">
           {tab === "chain" ? "Reasoning chain" : tab === "memory" ? "Memory" : "Database"}
-          <button className="adminClearBtn" onClick={onClear} type="button">
-            Clear
-          </button>
+          <div style={{ display: "flex", gap: "12px", alignItems: "center" }}>
+            <Link 
+              href="/admin/ingest" 
+              className="adminClearBtn" 
+              style={{ textDecoration: 'none', color: '#10b981', border: '1px solid #10b981', display: 'flex', alignItems: 'center', height: '22px' }}
+            >
+              RAG Ingest ↗
+            </Link>
+            <button className="adminClearBtn" onClick={onClear} type="button">
+              Clear
+            </button>
+          </div>
         </div>
 
         <div className="adminPaneBody">

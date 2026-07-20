@@ -25,6 +25,7 @@ from .prompts import (
 from backend.agent.tools.datetime_tool import get_current_datetime
 from backend.agent.tools.duffel_client import DuffelError, get_live_order_status
 from backend.agent.tools.flight_search import search_alternative_flights
+from backend.agent.tools.web_search import brave_web_search
 from backend.agent.tools.orders import OrderToolError, get_order
 from backend.agent.tools.policy_search import search_policy
 from backend.agent.validation import (
@@ -114,6 +115,22 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "brave_web_search",
+            "description": (
+                "Search the live internet for up-to-date information when internal policy documents or memory are insufficient."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query for the web"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "load_order_context",
             "description": (
                 "Load booking/order details for the user when a 6-character booking reference "
@@ -143,6 +160,7 @@ class AgentState(TypedDict, total=False):
     token_callback: Any
     sentence_callback: Any
     debug_callback: Any
+    status_callback: Any
     debug_trace: list[dict]
     tool_iterations: int
     for_voice: bool
@@ -178,6 +196,7 @@ async def run_agent_turn(
     token_callback: Any | None = None,
     sentence_callback: Any | None = None,
     debug_callback: Any | None = None,
+    status_callback: Any | None = None,
     for_voice: bool = False,
 ) -> AgentResult:
     graph = build_agent_graph()
@@ -191,6 +210,7 @@ async def run_agent_turn(
             "token_callback": token_callback,
             "sentence_callback": sentence_callback,
             "debug_callback": debug_callback,
+            "status_callback": status_callback,
             "for_voice": for_voice,
             "debug_trace": [],
             "tool_iterations": 0,
@@ -212,6 +232,8 @@ async def run_agent_turn(
 
 
 async def _plan_node(state: AgentState) -> AgentState:
+    if state.get("status_callback"):
+        await state["status_callback"]("planning")
     current_dt = await get_current_datetime()
     input_data = {
         "query": state["query"],
@@ -583,6 +605,16 @@ async def _tools_node(state: AgentState) -> AgentState:
 
     for tool_call in planned:
         name = tool_call.get("name")
+        if state.get("status_callback"):
+            if name == "search_policy":
+                await state["status_callback"]("retrieving")
+            elif name == "search_alternative_flights":
+                await state["status_callback"]("searching flights")
+            elif name == "brave_web_search":
+                await state["status_callback"]("searching web")
+            else:
+                await state["status_callback"](f"running {name}")
+                
         args = tool_call.get("args") or {}
         if name == "search_policy":
             category = args.get("category") or state.get("category") or "customer_refund"
@@ -643,6 +675,28 @@ async def _tools_node(state: AgentState) -> AgentState:
                 })
                 print(f"Flight search failed: {exc}")
                 flight_results = [{"error": str(exc)}]
+        elif name == "brave_web_search":
+            try:
+                search_query = args.get("query") or state["query"]
+                web_results = await brave_web_search(search_query)
+                tools_called.append("brave_web_search")
+                # Append web results to retrieved chunks for now, or add a new context variable
+                # Let's add it to a new variable or chunks. I'll add it as a fake chunk so the LLM uses it.
+                chunks.append({
+                    "id": "web_search_01",
+                    "title": "Web Search Results",
+                    "heading": search_query,
+                    "jurisdiction": "web",
+                    "chunk_text": web_results,
+                    "score": 1.0,
+                })
+            except Exception as exc:
+                tool_errors.append({
+                    "tool": "brave_web_search",
+                    "error": str(exc),
+                    "args": args,
+                })
+                print(f"Web search failed: {exc}")
         elif name == "load_order_context":
             try:
                 order_context = await _load_order_context(state)
@@ -703,6 +757,8 @@ async def _tools_node(state: AgentState) -> AgentState:
 
 
 async def _agent_node(state: AgentState) -> AgentState:
+    if state.get("status_callback"):
+        await state["status_callback"]("generating")
     retrieved = state.get("retrieved_chunks", [])
     flight_results = state.get("flight_results", [])
     language = state.get("language", "ur")

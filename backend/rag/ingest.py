@@ -56,18 +56,36 @@ def ingest_policy_corpus(corpus_dir: str | Path = "docs/files") -> dict[str, int
         if path.name.startswith("README"):
             continue
         document, chunks = chunk_policy_file(path)
-        policy_document_id = _upsert_policy_document(supabase, document)
-        records = [
-            _pinecone_record(policy_document_id, chunk)
-            for chunk in chunks
-        ]
-        for batch in _batched(records, 96):
-            index.upsert_records(namespace=PINECONE_NAMESPACE, records=batch)
-        _upsert_policy_chunks(supabase, policy_document_id, chunks)
+        _ingest_document_and_chunks(supabase, index, document, chunks)
         document_count += 1
         chunk_count += len(chunks)
 
     return {"documents": document_count, "chunks": chunk_count}
+
+
+def ingest_policy_text(raw_text: str, source_name: str) -> dict[str, int]:
+    from backend.rag.chunker import chunk_policy_text
+    
+    index_name = ensure_pinecone_index()
+    pc = Pinecone(api_key=_required_env("PINECONE_API_KEY"))
+    index = pc.Index(index_name)
+    supabase = get_service_supabase_client()
+
+    document, chunks = chunk_policy_text(raw_text, source_name=source_name)
+    _ingest_document_and_chunks(supabase, index, document, chunks)
+    
+    return {"documents": 1, "chunks": len(chunks)}
+
+
+def _ingest_document_and_chunks(supabase: Client, index: Any, document: PolicyDocument, chunks: list[PolicyChunk]) -> None:
+    policy_document_id = _upsert_policy_document(supabase, document)
+    records = [
+        _pinecone_record(policy_document_id, chunk)
+        for chunk in chunks
+    ]
+    for batch in _batched(records, 96):
+        index.upsert_records(namespace=PINECONE_NAMESPACE, records=batch)
+    _upsert_policy_chunks(supabase, policy_document_id, chunks)
 
 
 def _upsert_policy_document(client: Client, document: PolicyDocument) -> str:

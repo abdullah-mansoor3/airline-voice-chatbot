@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Response, WebSocket, WebSocketDisconnect, UploadFile, File, Form
+from .rag.ingest import ingest_policy_text
+from .rag.url_pdf_parser import parse_url_to_markdown, parse_pdf_bytes_to_markdown
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -442,6 +444,9 @@ async def _handle_text_turn(
             if is_admin:
                 await websocket.send_json({"type": "debug_trace", "entry": trace_entry})
 
+        async def status_callback(status: str):
+            await websocket.send_json({"type": "processing", "stage": status})
+
         agent_result = await run_agent_turn(
             text,
             language,
@@ -449,6 +454,7 @@ async def _handle_text_turn(
             memory_context=memory.for_prompt(),
             token_callback=token_callback,
             debug_callback=debug_callback if is_admin else None,
+            status_callback=status_callback,
         )
 
         await _send_admin_debug_bundle(
@@ -759,6 +765,11 @@ async def _handle_turn(
             if is_admin and not cancel_event.is_set():
                 await websocket.send_json({"type": "debug_trace", "entry": trace_entry})
 
+        async def status_callback(status: str):
+            if not cancel_event.is_set():
+                async with send_lock:
+                    await websocket.send_json({"type": "processing", "stage": status})
+
         agent_result = await run_agent_turn(
             agent_query,
             stt_result.language,
@@ -767,6 +778,7 @@ async def _handle_turn(
             token_callback=token_callback,
             sentence_callback=sentence_callback,
             debug_callback=debug_callback if is_admin else None,
+            status_callback=status_callback,
             for_voice=True,
         )
 
@@ -946,3 +958,120 @@ def _extension_for_mime_type(mime_type: str) -> str:
     if "wav" in mime_type:
         return "wav"
     return "webm"
+
+
+@app.post("/admin/ingest/preview")
+async def admin_ingest_preview(
+    authorization: str | None = Header(default=None),
+    source_type: str = Form(...),
+    url: str | None = Form(default=None),
+    file: UploadFile | None = File(default=None),
+    text: str | None = Form(default=None),
+    source_name: str | None = Form(default=None),
+    category: str | None = Form(default=None),
+    jurisdiction: str | None = Form(default=None),
+    carrier: str | None = Form(default=None),
+    regulator: str | None = Form(default=None),
+) -> dict[str, Any]:
+    token = _bearer_token(authorization)
+    try:
+        user = await verify_supabase_access_token(token)
+    except AuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+    svc = get_service_supabase_client()
+    profile = svc.table("users").select("role").eq("id", user.id).limit(1).execute()
+    if not profile.data or profile.data[0].get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden: admin access only.")
+
+    try:
+        if source_type == "url":
+            if not url:
+                raise HTTPException(status_code=400, detail="url is required for source_type='url'")
+            markdown_content = await parse_url_to_markdown(url)
+            name = source_name or url.split("/")[-1] or url
+        elif source_type == "pdf":
+            if not file:
+                raise HTTPException(status_code=400, detail="file is required for source_type='pdf'")
+            content_bytes = await file.read()
+            markdown_content = parse_pdf_bytes_to_markdown(content_bytes)
+            name = source_name or file.filename or "uploaded_pdf"
+        elif source_type == "text":
+            if not text:
+                raise HTTPException(status_code=400, detail="text is required for source_type='text'")
+            markdown_content = text
+            name = source_name or "raw_text_input"
+        else:
+            raise HTTPException(status_code=400, detail="Invalid source_type. Must be url, pdf, or text.")
+            
+        frontmatter_lines = []
+        if category: frontmatter_lines.append(f"category: {category}")
+        if jurisdiction: frontmatter_lines.append(f"jurisdiction: {jurisdiction}")
+        if carrier: frontmatter_lines.append(f"carrier: {carrier}")
+        if regulator: frontmatter_lines.append(f"regulator: {regulator}")
+        
+        if frontmatter_lines:
+            # If the markdown already has frontmatter, this prepended block will be parsed first.
+            fm = "---\n" + "\n".join(frontmatter_lines) + "\n---\n\n"
+            markdown_content = fm + markdown_content
+
+        from backend.rag.chunker import chunk_policy_text
+        doc, chunks = chunk_policy_text(markdown_content, source_name=name)
+        
+        return {
+            "status": "success",
+            "markdown": markdown_content,
+            "document": {
+                "title": doc.title,
+                "version": doc.version,
+                "category": doc.category,
+                "jurisdiction": doc.jurisdiction,
+            },
+            "chunks_count": len(chunks),
+            "chunks": [
+                {
+                    "index": c.chunk_index,
+                    "heading": c.heading,
+                    "text": c.chunk_text,
+                }
+                for c in chunks
+            ],
+            "name": name,
+        }
+    except Exception as exc:
+        print(f"[Ingest] ERROR: {exc}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Preview failed: {exc}")
+
+@app.post("/admin/ingest/confirm")
+async def admin_ingest_confirm(
+    authorization: str | None = Header(default=None),
+    text: str = Form(...),
+    source_name: str = Form(...),
+) -> dict[str, Any]:
+    token = _bearer_token(authorization)
+    try:
+        user = await verify_supabase_access_token(token)
+    except AuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+    svc = get_service_supabase_client()
+    profile = svc.table("users").select("role").eq("id", user.id).limit(1).execute()
+    if not profile.data or profile.data[0].get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden: admin access only.")
+
+    try:
+        print(f"[Ingest] Confirmed processing for source: {source_name}")
+        result = ingest_policy_text(
+            raw_text=text,
+            source_name=source_name
+        )
+        print(f"[Ingest] Successfully ingested {result['chunks']} chunks for {source_name}")
+        return {
+            "status": "success",
+            "chunks_ingested": result["chunks"]
+        }
+    except Exception as exc:
+        print(f"[Ingest] ERROR: {exc}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Ingestion failed: {exc}")

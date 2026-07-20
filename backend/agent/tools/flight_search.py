@@ -7,14 +7,6 @@ from .duffel_client import DuffelClient, DuffelError
 
 def _friendly_flight_error(exc: Exception) -> str:
     message = str(exc)
-    if "insufficient_permissions" in message or "air.offer_requests.create" in message:
-        return (
-            "Live flight search is not available right now because the Duffel API token "
-            "lacks offer-search permission. An admin must create a token with "
-            "'air.offer_requests.create' in the Duffel dashboard."
-        )
-    if "403" in message:
-        return "Live flight search is temporarily unavailable (Duffel access denied)."
     return f"Flight search failed: {message}"
 
 

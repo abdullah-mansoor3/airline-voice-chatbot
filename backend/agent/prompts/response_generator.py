@@ -47,7 +47,7 @@ _RESPONSE_TEMPLATE = """{airline_identity}
 
 {booking_modification_confirmation}
 
-When policy clauses are provided, ground legal answers only in those clauses. When no policy clauses are provided, answer from conversation memory, datetime context, flight results, or order context as appropriate. If flight results are empty, say no flights were found for that route/date. Stick to your role as an assistant, not a lawyer.
+When policy clauses or Web Search Results are provided, ground answers only in those clauses/results. When no policy clauses or web search results are provided, answer from conversation memory, datetime context, flight results, or order context as appropriate. If flight results are empty, say no flights were found for that route/date. Stick to your role as an assistant, not a lawyer.
 
 {output_format_json}
 
