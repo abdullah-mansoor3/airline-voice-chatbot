@@ -35,7 +35,11 @@ type ServerEvent =
   | { type: "pong" }
   | { type: "debug_trace"; entry: Record<string, unknown> }
   | { type: "debug_bundle"; payload: Record<string, unknown> }
-  | { type: "debug_memory"; memory: Record<string, unknown> };
+  | { type: "debug_memory"; memory: Record<string, unknown> }
+  | { type: "planning_complete"; tools: any[]; category?: string }
+  | { type: "tool_start"; tool: string }
+  | { type: "tool_complete"; tool: string; result: any }
+  | { type: "generation_start"; chunks_count?: number };
 
 type ConversationSummary = {
   id: string;
@@ -737,6 +741,25 @@ export default function ChatPage() {
         if (event.stage !== "tts") {
           setAgentThinking(true);
         }
+        break;
+
+      case "planning_complete":
+        console.log("Planning complete:", event.tools);
+        setStatus("Planning complete");
+        break;
+
+      case "tool_start":
+        console.log("Tool started:", event.tool);
+        setStatus(`Running ${event.tool}...`);
+        break;
+
+      case "tool_complete":
+        console.log("Tool complete:", event.tool, event.result);
+        break;
+
+      case "generation_start":
+        console.log("Generation started");
+        setStatus("Generating response...");
         break;
 
       case "transcript":

@@ -27,9 +27,9 @@ class MemoryContext:
     def for_prompt(self) -> dict[str, Any]:
         return {
             "user_profile": self.user_profile,
-            "long_term_facts": self.long_term_facts[:12],
+            "long_term_facts": self.long_term_facts[:6],
             "short_term_summary": self.short_term_summary,
-            "recent_messages": self.recent_messages[-4:],
+            "recent_messages": self.recent_messages[-3:],
         }
 
 
@@ -77,7 +77,7 @@ def _load_memory_context_sync(conversation: ConversationContext) -> MemoryContex
         .select("speaker,original_text,english_text,created_at")
         .eq("conversation_id", conversation.id)
         .order("turn_index", desc=True)
-        .limit(4)
+        .limit(3)
         .execute()
     )
     recent_messages = list(reversed(messages.data or []))
@@ -87,7 +87,7 @@ def _load_memory_context_sync(conversation: ConversationContext) -> MemoryContex
         .select("memory_key,memory_value,confidence,last_seen_at")
         .eq("user_id", conversation.user_id)
         .order("last_seen_at", desc=True)
-        .limit(12)
+        .limit(6)
         .execute()
     )
 
@@ -122,26 +122,30 @@ def _update_memory_after_turn_sync(
     try:
         previous = (
             client.table("conversations")
-            .select("short_term_summary")
+            .select("short_term_summary,turn_counter")
             .eq("id", conversation.id)
             .limit(1)
             .execute()
         )
         previous_summary = ""
+        turn_counter = 0
         if previous.data:
             previous_summary = previous.data[0].get("short_term_summary") or ""
+            turn_counter = previous.data[0].get("turn_counter") or 0
+            
+        turn_counter += 1
+        update_data = {"turn_counter": turn_counter}
 
-        new_summary = _llm_compress_summary(
-            previous_summary=previous_summary,
-            user_text=user_text,
-            agent_text=agent_text,
-        )
-        client.table("conversations").update(
-            {
-                "short_term_summary": new_summary,
-                "memory_updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-        ).eq("id", conversation.id).execute()
+        if turn_counter % 10 == 0:
+            new_summary = _llm_compress_summary(
+                previous_summary=previous_summary,
+                user_text=user_text,
+                agent_text=agent_text,
+            )
+            update_data["short_term_summary"] = new_summary
+            update_data["memory_updated_at"] = datetime.now(timezone.utc).isoformat()
+            
+        client.table("conversations").update(update_data).eq("id", conversation.id).execute()
     except Exception:
         pass  # column not yet migrated
 
@@ -199,7 +203,7 @@ def _llm_compress_summary(
         "- Preserves all key facts from the previous summary (claim type, airline, dates, amounts, references)\n"
         "- Incorporates what was just discussed\n"
         "- Removes redundant or resolved details\n"
-        "- Is at most 250 words, written as compressed points or phrases that retain the short term general direction and semantics of conversation\n"
+        "- Is at most 500 characters, written as compressed points or phrases that retain the short term general direction and semantics of conversation\n"
         "- Contains NO markdown, NO bullet points, NO headers\n"
         "Output only the summary text. Nothing else."
     )

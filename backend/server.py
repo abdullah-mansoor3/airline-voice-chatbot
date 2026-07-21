@@ -441,7 +441,30 @@ async def _handle_text_turn(
                 await websocket.send_json({"type": "agent_token", "text": delta})
 
         async def debug_callback(trace_entry: dict):
-            if is_admin:
+            event_type = trace_entry.get("type")
+            if event_type == "planning_complete":
+                await websocket.send_json({
+                    "type": "planning_complete",
+                    "tools": trace_entry.get("planned_tools", []),
+                    "category": trace_entry.get("category"),
+                })
+            elif event_type == "tool_start":
+                await websocket.send_json({
+                    "type": "tool_start",
+                    "tool": trace_entry.get("tool"),
+                })
+            elif event_type == "tool_complete":
+                await websocket.send_json({
+                    "type": "tool_complete",
+                    "tool": trace_entry.get("tool"),
+                    "result": trace_entry.get("result_summary"),
+                })
+            elif event_type == "generation_start":
+                await websocket.send_json({
+                    "type": "generation_start",
+                    "chunks_count": trace_entry.get("retrieved_chunks_count"),
+                })
+            elif is_admin:
                 await websocket.send_json({"type": "debug_trace", "entry": trace_entry})
 
         async def status_callback(status: str):
@@ -762,8 +785,32 @@ async def _handle_turn(
             await tts_queue.put(task)
 
         async def debug_callback(trace_entry: dict):
-            if is_admin and not cancel_event.is_set():
-                await websocket.send_json({"type": "debug_trace", "entry": trace_entry})
+            if not cancel_event.is_set():
+                event_type = trace_entry.get("type")
+                if event_type == "planning_complete":
+                    await websocket.send_json({
+                        "type": "planning_complete",
+                        "tools": trace_entry.get("planned_tools", []),
+                        "category": trace_entry.get("category"),
+                    })
+                elif event_type == "tool_start":
+                    await websocket.send_json({
+                        "type": "tool_start",
+                        "tool": trace_entry.get("tool"),
+                    })
+                elif event_type == "tool_complete":
+                    await websocket.send_json({
+                        "type": "tool_complete",
+                        "tool": trace_entry.get("tool"),
+                        "result": trace_entry.get("result_summary"),
+                    })
+                elif event_type == "generation_start":
+                    await websocket.send_json({
+                        "type": "generation_start",
+                        "chunks_count": trace_entry.get("retrieved_chunks_count"),
+                    })
+                elif is_admin:
+                    await websocket.send_json({"type": "debug_trace", "entry": trace_entry})
 
         async def status_callback(status: str):
             if not cancel_event.is_set():
